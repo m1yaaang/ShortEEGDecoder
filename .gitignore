@@ -1,0 +1,17 @@
+*/__pycache__
+*/.vscode
+*/Data_process
+*/eegpt_combine
+*/Modules
+*/utils.py
+*/utils_eval.py
+*/PreprocessedEEG
+*/logs
+*/wandb
+*/SVM
+*.png
+*.code-workspace
+*/LICENSE
+*.md
+*.txt
+*.ipynb_checkpoints
