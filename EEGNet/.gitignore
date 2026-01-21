@@ -1,0 +1,6 @@
+/logs/
+LICENSE
+*.md
+*.txt
+*.png
+.ipynb_checkpoints
