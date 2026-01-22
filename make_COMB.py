@@ -12,59 +12,193 @@ from tqdm import tqdm
     split and edit in code 217
 '''
 
+def get_file_paths(subject_id, run_n, data_dir):
+    stim_file_path = os.path.join(
+                data_dir,
+                f"{subject_id}",
+                "TRI",
+                "epochs_data",
+                f"{subject_id}_run{run_n}_stim_icaRej-epo.fif"
+            )
 
-CHANNEL_DICT = {k.upper():v for v,k in enumerate(     #62 ch
-                    [      'FP1', 'FPZ', 'FP2', 
-                    "AF7", 'AF3', 'AF4', "AF8", 
-        'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6', 'F8', 
-    'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 
-        'T7', 'C5', 'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 
-    'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2', 'CP4', 'CP6', 'TP8',
-            'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 
-                    'PO7', "PO5", 'PO3', 'POZ', 'PO4', "PO6", 'PO8', 
-                            'O1', 'OZ', 'O2', ])}
-
-
-drop_channels = ['TP9', 'TP10', 'FT9', 'FT10']
-chOrder_standard = [          # 57-4 = 53ch
-                            'Fpz',
-        'F7', 'F5', 'F3', 'F1', 'Fz', 'F2', 'F4', 'F6', 'F8', 
-    'FT7', 'FC5', 'FC3', 'FC1', 'FC2', 'FC4', 'FC6', 'FT8',
-        'T7', 'C5', 'C3', 'C1', 'Cz', 'C2', 'C4', 'C6', 'T8',
-    'TP7', 'CP5', 'CP3', 'CP1', 'CPz', 'CP2', 'CP4', 'CP6', 'TP8',
-        'P7', 'P5', 'P3', 'P1', 'Pz', 'P2', 'P4', 'P6', 'P8',
-                'PO7', 'PO3', 'POz', 'PO4', 'PO8', 
-                    'O1', 'O2', 'Oz']
+    iti_file_path = os.path.join(
+                data_dir,
+                f"{subject_id}",
+                "TRI",
+                "epochs_data",
+                f"{subject_id}_run{run_n}_iti_icaRej-epo.fif"
+        )
+    path = {
+        "stim": stim_file_path,
+        "iti": iti_file_path
+    }
+    return path
 
 
-# def read_fif(data_dir):
-# read data
-data_dir = "/local_raid3/03_user/myyu/hackathon_eeg"
-output_root = "/local_raid3/03_user/myyu/EEGPT/downstream_combine3/PreprocessedEEG/"
+def read_sample_info(subject_ids, data_dir):
+    """Reads information from a sample .fif file."""
+    sample_file = os.path.join(
+        data_dir,
+        f"{subject_ids[0]}",
+        "TRI",
+        "epochs_data",
+        f"{subject_ids[0]}_run01_stim_icaRej-epo.fif"
+    )
+    epochs = mne.read_epochs(sample_file, preload=True, verbose=False)
+    
+    # ch_names = epochs.info['ch_names']
+    # sampling_rate = epochs.info['sfreq']
 
-# subject_ids = ["16", "17", "22", "27", "33", "39", "40", "56", "58", "59", "64", "68", "69", "72", "79"]
-subject_ids = os.listdir(data_dir)
-run_ns = ["01", "02", "03", "04", "05", "06", "07", "08", "09"]
+    # result = {
+    #     "ch_names": ch_names,
+    #     "sampling_rate": sampling_rate
+    # }
+
+    return epochs.info
+
+def save_metadata(info, subject_id, data_dir):    
+    save_path = os.path.join(data_dir, f"{subject_id}_info.pkl")
+    with open(save_path, "wb") as f:
+        pickle.dump(info, f)
+        
+    # print(f"Full MNE Info object saved to {save_path}")
+
+def read_mne_data(file_path):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"The file {file_path} does not exist.")
+
+    epochs = mne.read_epochs(file_path, preload=True, verbose=False)
+
+    return epochs
+
+def preprocess_epochs(epochs, target_sr = None, drop_chs = None, ch_order = None):
+    if target_sr != epochs.info['sfreq'] and target_sr is not None:
+        epochs.resample(sfreq=target_sr)
+
+    if drop_chs is not None:
+        useless_chs = []
+        for ch in drop_chs:
+            if ch in epochs.info['ch_names']:
+                useless_chs.append(ch)
+        epochs.drop_channels(useless_chs)
+    if ch_order is not None and len(ch_order) == len(epochs.info['ch_names']):
+        epochs.reorder_channels(ch_order)
+    # Iterate through each trial within the Epochs object.
+
+    return epochs
+
+def extract_stim(epochs):
+
+    # Extract data and event labels into NumPy arrays.
+    X = epochs.get_data()      # Shape: (n_trials, n_channels, n_times)
+    y = epochs.events[:, 2]    # Shape: (n_trials,)
+    
+    X_list = []
+    y_list = []
+    # print(X.shape)
+    for i in range(len(X)):
+        single_trial_data = X[i]
+        single_trial_label = y[i]-1
+
+        X_list.append(single_trial_data)
+        y_list.append(single_trial_label)
+
+    return np.array(X_list), np.array(y_list), epochs.info['ch_names']
 
 
+def extract_iti(epochs, null_label=0):
 
-# CHANNEL_DICT = {k.upper():v for v,k in enumerate(     #62 ch
-#                  [      'FP1', 'FPZ', 'FP2', 
-#                     "AF7", 'AF3', 'AF4', "AF8", 
-#         'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6', 'F8', 
-#     'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 
-#         'T7', 'C5', 'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 
-#     'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2', 'CP4', 'CP6', 'TP8',
-#          'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 
-#                   'PO7', "PO5", 'PO3', 'POZ', 'PO4', "PO6", 'PO8', 
-#                            'O1', 'OZ', 'O2', ])}
+    # Extract data and event labels into NumPy arrays.
+    X = epochs.get_data()      # Shape: (n_trials, n_channels, n_times)
+    y = epochs.events[:, 2]    # Shape: (n_trials,)
+    
+    X_list = []
+    y_list = []
+
+    # print(X.shape)
+    n_trials = X.shape[0]
+    n_keep = int(n_trials * 0.2)  # 1/5
+    selected_idx = np.random.choice(n_trials, size=n_keep, replace=False)
+    for i in selected_idx:
+        single_trial_data = X[i]
+        # null data should be 1
+        # interval time(1s) between objects 
+        single_trial_label = null_label
+        
+        X_list.append(single_trial_data)
+        y_list.append(single_trial_label)
+
+    return np.array(X_list), np.array(y_list), epochs.info['ch_names']
 
 
+def export_np(subject_id, run_n, X_all, y_all, ch_names, save_dir, file_ext="npy"):
+    """
+    X_subj: (sum_trials, n_channels, n_times)
+    y_subj: (sum_trials,)
+    
+    if npz, data_structure: [subject] = [[x_subj,y_subj], [x_subj,y_subj], [x_subj,y_subj], ...]
+    """
 
-# null_file_path = data_dir / f"sub-{subject_id}" / "TRI" / "epochs_data" / f"sub-{subject_id}_run{run_n}_iti_icaRej-epo.fif"
-# read null data
+    mean = np.mean(X_all, axis=-1, keepdims=True)
+    std = np.std(X_all, axis=-1, keepdims=True)
 
-def process_and_save_data(subject_list, output_folder):
+    # 통계량을 하나의 배열로 결합 (Mean, Std 포함) -> (N_trials, n_channels, 2)
+    stats = np.concatenate([mean, std], axis=-1)
+
+    save_dir = os.path.join(save_dir, file_ext)
+    os.makedirs(save_dir, exist_ok=True)
+
+    if run_n is not None:
+        file_name = f"{subject_id}_run{run_n}"
+    else:
+        file_name = f"{subject_id}"
+
+
+    if file_ext == "npy":
+        np.save(os.path.join(save_dir, f"{file_name}.npy"), X_all)
+        np.save(os.path.join(save_dir, f"{file_name}_label.npy"), y_all)
+        np.save(os.path.join(save_dir, f"{file_name}_stats.npy"), stats)
+
+    elif file_ext == "npz":
+        np.savez_compressed(os.path.join(save_dir, f"{file_name}.npz"), X=X_all, y=y_all, ch_names=ch_names, stats=stats)
+    else:
+        raise ValueError(f"Unsupported file extension: {file_ext}")
+
+    # print(f"{subject_id}: X={X_all.shape}, y={y_all.shape}, y unique={np.unique(y_all)}")
+
+
+def export_pkl(subject_id, run_n, X_all, y_all, ch_names, save_dir):
+    """
+    X_subj: (sum_trials, n_channels, n_times)
+    y_subj: (sum_trials,)
+    stats: (sum_trials, n_channels, 2)  # Mean and Std
+    """
+
+    mean = np.mean(X_all, axis=-1, keepdims=True)
+    std = np.std(X_all, axis=-1, keepdims=True)
+
+    # 통계량을 하나의 배열로 결합 (Mean, Std 포함) -> (N_trials, n_channels, 2)
+    stats = np.concatenate([mean, std], axis=-1)
+
+
+    save_dir = os.path.join(save_dir,'pkl')
+    os.makedirs(save_dir, exist_ok=True)
+
+    if run_n is not None:
+        file_name = f"{subject_id}_run{run_n}"
+    else:
+        file_name = f"{subject_id}"
+
+    pickle.dump(
+        {"X": X_all, "y": y_all, "ch_names": ch_names, "stats": stats},
+        open(os.path.join(save_dir, f"{file_name}.pkl"), "wb"),
+    )
+
+    # print(f"{file_name}: X={X_all.shape}, y={y_all.shape}, y unique={np.unique(y_all)}")
+        
+        
+
+def process_and_save_data(subject_ids, run_ns, data_dir, output_dir, drop_chs, ch_order, resample_rate, save_format, save_mode):
     """Processes MNE Epochs from .fif files and saves each trial as a .pkl file.
 
     This function iterates through a list of subject IDs, reads their corresponding
@@ -73,177 +207,65 @@ def process_and_save_data(subject_list, output_folder):
 
     Args:
         subject_list (list): A list of subject identifier strings to process.
-        output_folder (str): The path to the directory where the .pkl files will be saved.
+        output_dir (str): The path to the directory where the .pkl files will be saved.
     """
 
-
     # Create the output directory if it doesn't exist.
-    os.makedirs(output_folder, exist_ok=True)
-    
-    print(f"\nProcessing data for: {os.path.basename(output_folder)}")
-    
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"\nProcessing data for: {os.path.basename(output_dir)}")
+
+    sample_info = read_sample_info(subject_ids, data_dir)
+    use_channels_names = sample_info["ch_names"]
+    print(f"Using {len(use_channels_names)} channels from sample data.")
 
 
-    for subject_id in tqdm(subject_list, desc=f"Processing {os.path.basename(output_folder)}"):
+    for subject_id in tqdm(subject_ids, desc=f"Processing {os.path.basename(output_dir)}"):
+        subject_data_buffer = []  # Subject data buffer
+        subject_label_buffer = []
+
         for run_n in run_ns:
             # Construct the full path to the .fif file.
-            stim_file_path = os.path.join(
-                data_dir,
-                f"{subject_id}",
-                "TRI",
-                "epochs_data",
-                f"{subject_id}_run{run_n}_stim_icaRej-epo.fif"
-            )
-
-            iti_file_path = os.path.join(
-                data_dir,
-                f"{subject_id}",
-                "TRI",
-                "epochs_data",
-                f"{subject_id}_run{run_n}_iti_icaRej-epo.fif"
-            )
-
-            # Skip if the file does not exist.
-            if not os.path.exists(stim_file_path) or not os.path.exists(iti_file_path) :
-                continue
+            path = get_file_paths(subject_id, run_n, data_dir)
 
             try:
-                # Read the MNE Epochs file.
-                #####################################################
-                #               stim -> not null
-                #####################################################
-                epochs = mne.read_epochs(stim_file_path, preload=True, verbose=False, )
-                epochs.resample(sfreq=256)
-        
-                info = epochs.info['ch_names']
-                # assert epochs.info['ch_names'] == use_channels_names, f"channel order is different from channel_ref"
-                # print(info)
-                if drop_channels is not None:
-                    useless_chs = []
-                    for ch in drop_channels:
-                        if ch in info:
-                            useless_chs.append(ch)
-                    epochs.drop_channels(useless_chs)
-                if chOrder_standard is not None and len(chOrder_standard) == len(epochs.info['ch_names']):
-                    epochs.reorder_channels(chOrder_standard)
-                # Iterate through each trial within the Epochs object.
+                epochs_stim = read_mne_data(path["stim"])
+                epochs_iti = read_mne_data(path["iti"])
 
-                # Extract data and event labels into NumPy arrays.
-                X = epochs.get_data()      # Shape: (n_trials, n_channels, n_times)
-                y = epochs.events[:, 2]    # Shape: (n_trials,)
-                
-                # print(X.shape)
-                for i in range(len(X)):
-                    single_trial_data = X[i]
-                    single_trial_label = y[i]
-                    
-                    # Create a dictionary to store the signal and its corresponding label.
-                    sample = {
-                        "signal": single_trial_data, 
-                        "label": single_trial_label,
-                        "ch_names": info
-                    }
-                    
-                    # Generate a unique filename for each trial.
-                    output_filename = f"{subject_id}_run-{run_n}_trial-{i:03d}.pkl"
-                    output_path = os.path.join(output_folder, output_filename)
-                    
-                    # Save the dictionary as a pickle file.
-                    with open(output_path, 'wb') as f:
-                        pickle.dump(sample, f)
+                epochs_stim = preprocess_epochs(epochs_stim, resample_rate, drop_chs, ch_order)
+                epochs_iti = preprocess_epochs(epochs_iti, resample_rate, drop_chs, ch_order)
 
-                #####################################################
-                #               iti -> null
-                #####################################################
-                epochs = mne.read_epochs(iti_file_path, preload=True, verbose=False, )
-                epochs.resample(sfreq=256)
-        
-                info = epochs.info['ch_names']
-                # assert epochs.info['ch_names'] == use_channels_names, f"channel order is different from channel_ref"
-                # print(info)
-                if drop_channels is not None:
-                    useless_chs = []
-                    for ch in drop_channels:
-                        if ch in info:
-                            useless_chs.append(ch)
-                    epochs.drop_channels(useless_chs)
-                if chOrder_standard is not None and len(chOrder_standard) == len(epochs.info['ch_names']):
-                    epochs.reorder_channels(chOrder_standard)
-                # Iterate through each trial within the Epochs object.
+                x_stim, y_stim, _ = extract_stim(epochs_stim)
+                x_iti, y_iti, _ = extract_iti(epochs_iti)  
 
-                # Extract data and event labels into NumPy arrays.
-                X = epochs.get_data()      # Shape: (n_trials, n_channels, n_times)
-                y = epochs.events[:, 2]    # Shape: (n_trials,)
-                
-                # print(X.shape)
-                n_trials = X.shape[0]
-                n_keep = int(n_trials * 0.2)  # 1/5
-                selected_idx = np.random.choice(n_trials, size=n_keep, replace=False)
-                for i in selected_idx:
-                    single_trial_data = X[i]
-                    # null data should be 1
-                    # interval time(1s) between objects 
-                    single_trial_label = 1
-                    
-                    # Create a dictionary to store the signal and its corresponding label.
-                    sample = {
-                        "signal": single_trial_data, 
-                        "label": single_trial_label,
-                        "ch_names": info
-                    }
-                    
-                    # Generate a unique filename for each trial.
-                    output_filename = f"{subject_id}_run-{run_n}_trial-{i:03d}-null.pkl"
-                    output_path = os.path.join(output_folder, output_filename)
-                    
-                    # Save the dictionary as a pickle file.
-                    with open(output_path, 'wb') as f:
-                        pickle.dump(sample, f)
+                x_all = np.concatenate((x_stim, x_iti), axis=0)
+                y_all = np.concatenate((y_stim, y_iti), axis=0)
+                # breakpoint()
 
-                
-
+                if save_mode == 'run':
+                    if save_format == 'npy' or save_format == 'npz':
+                        export_np(subject_id, run_n, x_all, y_all, use_channels_names, output_dir, file_ext=save_format)
+                    elif save_format == 'pkl':
+                        export_pkl(subject_id, run_n, x_all, y_all, use_channels_names, output_dir)
+            except FileNotFoundError:
+                # File not found (just print)
+                continue
             except Exception as e:
-                print(f"Error processing file {stim_file_path}: {e}")
-
-def split_and_dump(params):
-    fetch_folder, sub, dump_folder, label = params
-    for file in os.listdir(fetch_folder):
-        if sub in file:
-            print("process", file)
-            file_path = os.path.join(fetch_folder, file)
-            raw = mne.io.read_raw_edf(file_path, preload=True)
-            try:
-                if drop_channels is not None:
-                    useless_chs = []
-                    for ch in drop_channels:
-                        if ch in raw.ch_names:
-                            useless_chs.append(ch)
-                    raw.drop_channels(useless_chs)
-                if chOrder_standard is not None and len(chOrder_standard) == len(raw.ch_names):
-                    raw.reorder_channels(chOrder_standard)
-                if raw.ch_names != chOrder_standard:
-                    raise Exception("channel order is wrong!")
-
-                raw.filter(l_freq=0.1, h_freq=75.0)
-                raw.notch_filter(50.0)
-                raw.resample(200, n_jobs=5)
-
-                ch_name = raw.ch_names
-                raw_data = raw.get_data(units='uV')
-                channeled_data = raw_data.copy()
-            except:
-                with open("tuab-process-error-files.txt", "a") as f:
-                    f.write(file + "\n")
+                print(f"Error processing {subject_id} Run {run_n}: {e}")
                 continue
-            for i in range(channeled_data.shape[1] // 2000):
-                dump_path = os.path.join(
-                    dump_folder, file.split(".")[0] + "_" + str(i) + ".pkl"
-                )
-                pickle.dump(
-                    {"X": channeled_data[:, i * 2000 : (i + 1) * 2000], "y": label},
-                    open(dump_path, "wb"),
-                )
 
+        subject_data_buffer.append(x_all)
+        subject_label_buffer.append(y_all)
+        save_metadata(epochs_stim.info, subject_id, os.path.join(output_dir, save_format))
+        
+        if save_mode == 'subject':
+
+            X_subject = np.concatenate(subject_data_buffer, axis=0)
+            y_subject = np.concatenate(subject_label_buffer, axis=0)
+
+            if save_format == 'npy' or save_format == 'npz':
+                export_np(subject_id, None, X_subject, y_subject, use_channels_names, output_dir, file_ext=save_format)
+            elif save_format == 'pkl':
+                export_pkl(subject_id, None, X_subject, y_subject, use_channels_names, output_dir)
 
 # %% MAIN
 # region
@@ -251,24 +273,33 @@ None
 # endregion
 if __name__ == "__main__":
     
-    # np.random.seed(42) # settle 
-    # np.random.shuffle(subject_ids)
 
-    # train_subjects = subject_ids[:int(len(subject_ids) * 0.8)]
-    # # val_subjects = subject_ids[int(len(subject_ids) * 0.7):int(len(subject_ids) * 0.8)]
-    # test_subjects = subject_ids[int(len(subject_ids) * 0.8):]
+    # data_dir = "/local_raid3/03_user/myyu/hackathon_eeg"
+    data_dir = "/local_raid3/03_user/hoian/brlBandit/hackathon_eeg"
+    output_root = "/local_raid3/03_user/myyu/EEG_decoder/EEG(500Hz)_COMB"
 
-    # print(f"Total subjects: {len(subject_ids)}")
-    # print(f"Train subjects ({len(train_subjects)}): {train_subjects}")
-    # # print(f"Validation subjects ({len(val_subjects)}): {val_subjects}")
-    # print(f"Test subjects ({len(test_subjects)}): {test_subjects}")
+    subject_ids = os.listdir(data_dir)
+    run_ns = ["01", "02", "03", "04", "05", "06", "07", "08", "09"]
 
-    # process_and_save_data(train_subjects, os.path.join(output_root, "processed_train"))
-    # # process_and_save_data(val_subjects, os.path.join(output_root, "processed_eval"))
-    # process_and_save_data(test_subjects, os.path.join(output_root, "processed_test"))
-    
+    np.random.seed(42) # settle random seed for reproducibility
+    np.random.shuffle(subject_ids)
 
+    train_subjects = subject_ids[:int(len(subject_ids) * 0.8)]
+    test_subjects = subject_ids[int(len(subject_ids) * 0.8):]
 
     print(f"Total subjects: {len(subject_ids)}")
+    print(f"Train subjects ({len(train_subjects)}): {train_subjects}")
+    print(f"Test subjects ({len(test_subjects)}): {test_subjects}")
 
-    process_and_save_data(subject_ids, os.path.join(output_root, "processed_All"))
+    process_and_save_data(
+        subject_ids=train_subjects, run_ns=run_ns, data_dir=data_dir, 
+        output_dir= os.path.join(output_root, "processed_train"), 
+        drop_chs=None, ch_order=None, resample_rate=None, save_format="npy", save_mode="subject"
+    )
+    process_and_save_data(
+        subject_ids=test_subjects, run_ns=run_ns, data_dir=data_dir, 
+        output_dir= os.path.join(output_root, "processed_test"), 
+        drop_chs=None, ch_order=None, resample_rate=None, save_format="npy", save_mode="subject"
+    )
+
+    print("Save complete.")

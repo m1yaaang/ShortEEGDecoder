@@ -15,3 +15,6 @@
 *.md
 *.txt
 *.ipynb_checkpoints
+*/*/logs
+*/*/wandb
+EEG(500Hz)_COMB
