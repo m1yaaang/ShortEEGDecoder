@@ -56,7 +56,7 @@ def read_sample_info(subject_ids, data_dir):
 
     return epochs.info
 
-def save_metadata(info, subject_id, data_dir):    
+def save_metadata(info, subject_id, data_dir):      # mne info object
     save_path = os.path.join(data_dir, f"{subject_id}_info.pkl")
     with open(save_path, "wb") as f:
         pickle.dump(info, f)
@@ -142,7 +142,7 @@ def export_np(subject_id, run_n, X_all, y_all, ch_names, save_dir, file_ext="npy
     mean = np.mean(X_all, axis=-1, keepdims=True)
     std = np.std(X_all, axis=-1, keepdims=True)
 
-    # 통계량을 하나의 배열로 결합 (Mean, Std 포함) -> (N_trials, n_channels, 2)
+    # 통계량을 하나의 배열로 결합 (Mean, Std 포함) -> (N_trials, n_channels, [mean, std])
     stats = np.concatenate([mean, std], axis=-1)
 
     save_dir = os.path.join(save_dir, file_ext)
@@ -253,9 +253,9 @@ def process_and_save_data(subject_ids, run_ns, data_dir, output_dir, drop_chs, c
                 print(f"Error processing {subject_id} Run {run_n}: {e}")
                 continue
 
-        subject_data_buffer.append(x_all)
-        subject_label_buffer.append(y_all)
-        save_metadata(epochs_stim.info, subject_id, os.path.join(output_dir, save_format))
+            subject_data_buffer.append(x_all)
+            subject_label_buffer.append(y_all)
+            save_metadata(epochs_stim.info, subject_id, os.path.join(output_dir, save_format))
         
         if save_mode == 'subject':
 
