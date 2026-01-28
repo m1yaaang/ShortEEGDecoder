@@ -10,6 +10,22 @@ from sklearn.metrics import recall_score, confusion_matrix, balanced_accuracy_sc
 from abc import ABC, abstractmethod
 import seaborn as sns
 import pandas as pd
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn.metrics import confusion_matrix, balanced_accuracy_score, roc_auc_score, precision_score, recall_score, accuracy_score
+from tqdm import tqdm
+from EEGNet.EEGNet_util import EEGNet 
+
+# import os
+# # from EEGNet.EEGNet_util import EEGNet  <--- ����
+
+# def get_model(config):
+#     from EEGNet.EEGNet_util import EEGNet 
+    
+#     model = EEGNet(...)
+#     return model
+
 
 class BaseFileHandler(ABC):
     """
@@ -301,91 +317,380 @@ class COMBDataset(torch.utils.data.Dataset):
 
         return X, Y, stat, mask
 
+
 class InferenceManager:
     def __init__(self, config, model):
-        pass
-    def __call__(self, *args, **kwds):
-        pass
-    def _load_model(self, patch_idx):
-        if config["model_load_from"]:
-            self.model.ckpt_load(config["model_load_from"])
-        pass
+        self.config = config
+        self.model = model
+        
+        # 1. 내부 모델 초기화(config를 넘겨줌)
+        self.predictor = Predictor(config)    # 모델 결과 추론
+        self.loader = ResultLoader(config)    # CSV 로더(추론 대신)
+        self.evaluator = Evaluator(config)    # Metric 평가
+        self.recorder = Recorder(config)      # CSV 저장
+        self.visualizer = Visualizer(config)  # 시각화
+        
+        # 2. 체크포인트 경로 자동 탐색(config_dir)
+        self.ckpt_paths = self._discover_checkpoints()
+        
+        # 3. Patch 개수 자동 계산
+        self.num_patches = self._calculate_num_patches()
+
+    def _discover_checkpoints(self):
+        """ckpt_dir 내의 모든 .pth파일을 재귀적으로 찾거나 구조에 맞춰 탐색"""
+        if not os.path.exists(self.config['ckpt_dir']):
+            print(f" Checkpoint dir not found: {self.config['ckpt_dir']}")
+            return []
+            
+        # 예: patch_0, patch_1 폴더 내부의 .pth 파일등 중 best만 찾거나 전체 리스트 업
+        # 사용자 파일 구조에 맞춰 패턴 사용
+        best_model_paths = []
+
+        ckpt_lists = os.listdir(self.config['ckpt_dir'])
+        ckpt_lists = [d for d in ckpt_lists if os.path.isdir(os.path.join(self.config['ckpt_dir'], d))] # 폴더 안에 logs 안에 ckpt가 있는 경우
+        ckpt_lists.sort()
+
+        """
+        patch 0
+            - logs
+                - ckpt1
+                - ckpt2
+        patch 1
+            - logs
+        """
+        for p in ckpt_lists:
+            if "None" in p:
+                continue
+            ckpt_best_acc = -1.0
+            ckpt_best_file = None
+            patch_dir = os.path.join(self.config['ckpt_dir'], p)
+            ckpts = [f for f in os.listdir(patch_dir) if f.endswith(".pth")]
+            for c in ckpts:
+                try:
+                    c_acc = float(c.split("_acc=")[-1].replace(".pth",""))
+                    if c_acc > ckpt_best_acc:
+                        ckpt_best_acc = c_acc
+                        ckpt_best_file = c
+                except:
+                    continue
+            best_model_paths.append(os.path.join(patch_dir, ckpt_best_file))
+        
+        # best는 여기서 구현
+        # epoch으로 고정하던지 best만 선택하는 함수를 추가 구현하기
+        return best_model_paths
+
+    def _calculate_num_patches(self):
+        """데이터 전체 길이를 time_bin으로 나누어 총 패치 수 계산"""
+        # 임시로 데이터 하나를 로드해서 전체 길이를 파악
+        temp_ds = COMBDataset(config=self.config)
+        total_len, _ = temp_ds._get_sample_info()
+        return total_len // self.config['time_bin']
+
+
+    def run(self):
+        print(f" Start Pipeline in Skip Prediction[{self.config['skip_pred']}]")
+        print(f"   - Found {len(self.ckpt_paths)} checkpoints")
+        print(f"   - Total Test Patches: {self.num_patches}")
+
+        global_tgm_data = []
+
+        for ckpt in self.ckpt_paths:
+            print(f"\n==> Evaluating Checkpoint: {ckpt}")
+            train_patch_idx = self._parse_patch_from_path(ckpt)
+            train_start_ms, train_end_ms = get_patch_time_ms(train_patch_idx, config['time_bin'], config['sampling_rate'])
+            print(f"Train Patch{train_patch_idx}({train_start_ms}~{train_end_ms})")  
+
+            # net = None
+            model = self.model
+            if not self.config["skip_pred"]:
+                model = self._load_model_instance(ckpt, self.model)
+
+            for test_patch_idx in range(self.num_patches):
+                # Test Loader 생성
+                test_start_ms, test_end_ms = get_patch_time_ms(test_patch_idx, self.config['time_bin'], self.config['sampling_rate'])
+                print(f"Test Patch{test_patch_idx}({test_start_ms}~{test_end_ms})")
+                
+                #[Step 1] Data source
+                if not self.config["skip_pred"]:
+                    preds,labels,probs = self.predictor.predict(model, test_patch_idx)
+                    self.recorder.save_detail_csv(ckpt, train_patch_idx, test_patch_idx, preds, labels, probs)
+                else: #Only Analysis
+                    preds,labels,probs = self.loader.load_csv(train_patch_idx, test_patch_idx)
+
+                #[Step 2] Evaluation
+                metrics  = self.evaluator.compute_metrics(preds, labels, probs, params=config["metrics"])
+
+                #[Step 3] Visualization (CM)
+                self.visualizer.plot_cm(ckpt, labels, preds, train_patch_idx, test_patch_idx, metrics['acc'])
+
+                #[Step 4] TGM Data Collection
+                global_tgm_data.append({
+                    'train_patch_idx': train_patch_idx,
+                    'train_time_ms': train_start_ms,
+                    'test_patch_idx': test_patch_idx,
+                    'test_time_ms': test_start_ms,
+                    'test_acc': metrics['acc'],
+                    'test_bal_acc': metrics['bal_acc']
+                })
+            
+        if model: del model
+        torch.cuda.empty_cache()
+
+        # [Step 5] Final TGM Plotting 
+        if global_tgm_data:
+            df_summary = pd.DataFrame(global_tgm_data)
+            self.recorder.save_summary_csv(df_summary)
+
+            # TGM 시각화 (Acc, Bal_Acc)
+            self.visualizer.plot_tgm(ckpt, df_summary, metric_key='test_acc')
+            self.visualizer.plot_tgm(ckpt, df_summary, metric_key='test_bal_acc')
+
+        return
+
+    # --- Helper Methods ---
+    def _parse_patch_from_path(self, ckpt_path):
+        # 파일명에서 patch_idx 추출 로직(사용자 규칙에 맞게)
+        # 예: ".../patch_3/..." -> 3
+        try:
+            return int(ckpt_path.split("patch_")[1].split("/")[0])
+        except:
+            return 0 # 파싱 실패시 예외 처리
+
+    def _load_model_instance(self, ckpt_path, net):
+        # Config에 있는 model로 인스턴스 생성후 가중치 로드
+        
+        # model = self.net(n_channels=input_ch, n_timepoints=input_len, n_classes=self.config['n_classes'])
+        
+        checkpoint = torch.load(ckpt_path)
+        state = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+        net.load_state_dict(state_dict = state)
+        net.cuda().eval()
+        return net
+    
 
     def _create_loader(self, patch_idx):
         pass
-    def run_all_patches(self):
-        pass
 
 class Predictor:
-    def __init__(self, model, device):
-        self.model = model
-        self.device = device
-    def ckpt_load(self, ckpt_path):
-        checkpoint = torch.load(ckpt_path)
-        # 체크포인트에 'model_state_dict'가 있으면 해당 상태를 로드
-        if 'model_state_dict' in checkpoint:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            # 체크포인트가 'model_state_dict'를 포함하지 않으면 전체 체크포인트를 로드
-            self.model.load_state_dict(checkpoint)
+    def __init__(self, config):
+        self.config = config
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    def predict(self, model, data_loader):
-        self.model.eval()
+    def predict(self, model, test_patch_idx):
+
+        test_config = self.config.copy()
+        test_config["patch_idx"] = test_patch_idx
+
+        test_patch_dataset = COMBDataset(config=test_config)
+        test_patch_loader = torch.utils.data.DataLoader(
+                                            test_patch_dataset,
+                                            batch_size=self.config["batch_size"],
+                                            shuffle=False,
+                                            num_workers=self.config["num_workers"],
+                                            collate_fn=torch_collate_fn)
+
+
+        model.eval() 
+
         all_preds = []
         all_labels = []
-        with torch.no_grad():   
-            for batch_x, batch_y, _, _ in data_loader:
-                batch_x = batch_x.to(self.device)
-                outputs = model(batch_x)
-                _, preds = torch.max(outputs, 1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(batch_y.numpy())
-        return all_preds, all_labels
+        all_probs = []
         
+        with torch.no_grad():
+            for inputs, labels, _, _ in test_patch_loader:
+                inputs = inputs.cuda(0)
+                outputs = model(inputs)
+                probs = F.softmax(outputs, dim=1)
+                preds = torch.argmax(outputs, dim=1)
+
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.numpy())
+                all_probs.extend(probs.cpu().numpy())
+
+        all_preds = np.array(all_preds)
+        all_labels = np.array(all_labels)
+        all_probs = np.array(all_probs)
+
+        return all_preds, all_labels, all_probs
+
+class ResultLoader:
+    def __init__(self, config):
+        self.csv_dir = config['csv_input_dir']
+
+    def load_csv(self, train_idx, test_idx):
+        preds, labels, probs = [], [], []
+        csv_path = os.path.join(self.csv_dir, f"TrainP{train_idx}_TestP{test_idx}_results.csv")
+        if os.path.exists(csv_path):
+            df = pd.read_csv(csv_path)
+            preds = df['prediction'].values
+            labels = df['label'].values
+            probs = df['probability'].values
+        return preds, labels, probs
 
 class Evaluator:
-    def __init__(self):
-        pass
-    def compute_metrics(self, all_preds, all_labels):
-        pass
+    def __init__(self, config):
+        self.is_label_null = config["is_label_null"]
+    def compute_metrics(self, preds, labels, probs,params):
+        results = {}  
+        
+        for param in params:
+            if param == 'acc':
+                if self.is_label_null: 
+                    results['acc'] = self._acc_w_null(preds, labels, metrics='acc')
+                else:
+                    results['acc'] = accuracy_score(labels, preds)
+            
+            if param == 'bal_acc':
+                if self.is_label_null:
+                    results['bal_acc'] = self._acc_w_null(preds, labels, metrics='bal_acc')
+                else:
+                    results['bal_acc'] = balanced_accuracy_score(labels, preds)
+            
+            if param == "auc":
+                # Multi-class AUC (one-vs-rest)
+                try:
+                    results['auc'] = roc_auc_score(labels, probs, multi_class='ovr')
+                except:
+                    results['auc'] = 0.0
+            
+            if param == "recall":
+                results['recall'] = recall_score(labels, preds, average='macro')
+            
+            if param == "precision":
+                results['precision'] = precision_score(labels, preds, average='macro', zero_division=0.0)
+            
+            if param == "fmeasure":
+                precision = precision_score(labels, preds, average='macro', zero_division=0.0, labels=np.unique(labels))
+                recall = recall_score(labels, preds, average='macro', zero_division=0.0, labels=np.unique(labels))
+                
+                if precision + recall > 0:
+                    results['fmeasure'] = 2 * precision * recall / (precision + recall)
+                else:
+                    results['fmeasure'] = 0.0
+        return results
+    def _acc_w_null(self, preds, labels, metrics):
+
+        np_preds = np.array(preds)
+        np_labels = np.array(labels)
+
+        # 0번 클래스(배경/노이즈) 제외
+        valid_indices = np.where(np_labels != 0)[0]
+        
+        if len(valid_indices) > 0:
+            filtered_preds = np_preds[valid_indices]
+            filtered_labels = np_labels[valid_indices]
+            
+            acc = 100 * (filtered_preds == filtered_labels).sum() / len(valid_indices)
+            # bal_acc = 100 * balanced_accuracy_score(filtered_labels, filtered_preds )
+            bal_acc = 100 * recall_score(
+                                        filtered_labels, 
+                                        filtered_preds, 
+                                        average='macro',       # Macro Average Recall = Balanced Accuracy
+                                        zero_division=0.0, 
+                                        labels=np.unique(filtered_labels)   # 참고: "다중 클래스 분류"에서 사용
+                                        )
+        else:
+            filtered_preds, filtered_labels = [], []
+            acc, bal_acc = 0.0, 0.0
+
+        if metrics == 'acc':
+            return acc
+        elif metrics == 'bal_acc':
+            return bal_acc
+        else:
+            raise ValueError(f"Unsupported metric: {metrics}")
+
 
 class Recorder:
-    def __init__(self):
-        pass
-    def save_detailed_results(self, info_dict, csv_save_path, preds, labels, prob = None):
-        csv_dir = os.path.dirname(csv_save_path)
+    def __init__(self, config):
+        self.time_bin = config["time_bin"]
+        self.sr = config["sampling_rate"]
+        self.save_dir = config["save_dir"]
+
+    def save_detail_csv(self, ckpt, train_patch_idx, test_patch_idx, preds, labels, probs):
+        csv_dir = os.path.join(os.path.dirname(ckpt),'csv')
         os.makedirs(csv_dir, exist_ok=True)
-        df = pd.DataFrame(info_dict)
-        df.to_csv(csv_save_path, index=False)
+        csv_filename = f"TrainP{train_patch_idx}_TestP{test_patch_idx}_results.csv"
+        csv_save_path = os.path.join(csv_dir, csv_filename)
 
-        # Save additional prediction details
-        preds_df = pd.DataFrame({'preds': preds, 'labels': labels})
-        preds_df.to_csv(os.path.join(csv_dir, "predictions.csv"), index=False)
 
-        if prob is not None:
-            prob_df = pd.DataFrame(prob)
-            prob_df.to_csv(os.path.join(csv_dir, "probabilities.csv"), index=False)
+        train_start_ms, train_end_ms = get_patch_time_ms(train_patch_idx, self.time_bin, self.sr)
+        test_start_ms, test_end_ms = get_patch_time_ms(test_patch_idx, self.time_bin, self.sr)
+        results_detail = {
+            'train_patch_idx': train_patch_idx,
+            'train_time_ms': train_start_ms,
+            'test_patch_idx': test_patch_idx,
+            'test_time_ms': test_start_ms,
+            'prediction': preds,
+            'labels': labels,
+        }
+        if len(probs.shape) > 1: 
+            for i in range(probs.shape[1]):
+                results_detail[f"prob_{i}"] = probs[:, i] 
+
+        df_detail = pd.DataFrame(results_detail)
+        df_detail.to_csv(csv_save_path, index=False)
+    
+    def save_summary_csv(self, df, save_dir=None):
+        if save_dir == None:
+            save_dir = self.save_dir
+        elif not os.path.exists(save_dir):
+            raise ValueError(f"There's no {save_dir}")
+
+        summary_csv_path = os.path.join(save_dir, "summary.csv")
+        df.to_csv(summary_csv_path, index=False)
 
 class Visualizer:
-    def __init__(self, base_dir):
-        pass
-    def plot_cm(self, labels, preds, cm_save_path, cm_title):
-        cm_dir = os.path.dirname(cm_save_path)
+    def __init__(self, config):
+        self.time_bin = config["time_bin"]
+        self.sr = config["sampling_rate"]
+
+    def plot_cm(self, ckpt, labels, preds, train_patch_idx, test_patch_idx, final_acc):
+
+        train_start_ms, train_end_ms = get_patch_time_ms(train_patch_idx, self.time_bin, self.sr)
+        test_start_ms, test_end_ms = get_patch_time_ms(test_patch_idx, self.time_bin, self.sr)
+        
+        cm_dir = os.path.join(os.path.dirname(ckpt),'cm')
         os.makedirs(cm_dir, exist_ok=True)
-        pass
-    def plot_tgm(self):
-        pass
-    
-    def plot_tgm_from_df(df, metric_key='test_acc', save_dir='./'):
+
+        # Confusion Matrix 저장
+        cm_filename = f"TrainP{train_patch_idx}_TestP{test_patch_idx}_Acc{final_acc:.2f}_cm.png"
+        cm_save_path = os.path.join(cm_dir, cm_filename)
+
+        cm_title = f"Train P{train_patch_idx}({train_start_ms}~{train_end_ms}) / Test P{test_patch_idx}({test_start_ms}~{test_end_ms})\nAcc: {final_acc:.2f}%"
+        label_names = np.unique(labels)
+
+        cm = confusion_matrix(labels, preds, labels=label_names)
+
+        fig_cm, ax_cm = plt.subplots(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax_cm,
+                    xticklabels=[f"Class_{i}" for i in label_names],
+                    yticklabels=[f"Class_{i}" for i in label_names])
+        ax_cm.set_xlabel('Predicted')
+        ax_cm.set_ylabel('True')
+        ax_cm.set_title(cm_title)
+        ax_cm.invert_yaxis()
+        
+        plt.tight_layout()
+        plt.savefig(cm_save_path, dpi=150)
+        plt.close('all')
+        return 
+
+
+    def plot_tgm(self, ckpt, df, metric_key='test_acc', save_dir=None):
         """
         [기능]
         - DataFrame의 모든 숫자 데이터(idx, ms)를 이용해 TGM Heatmap을 그립니다.
         - 문자열 컬럼(_str)이 없어도 동작하며, 모든 라벨을 전부 표시합니다.
         """
-        
+        if save_dir == None:
+            save_dir = self.save_dir
+        elif not os.path.exists(save_dir):
+            raise ValueError(f"There's no {save_dir}")
         # 1. Pivot Table (Matrix 변환)
         tgm_matrix = df.pivot(index='train_patch_idx', columns='test_patch_idx', values=metric_key)
         matrix_values = tgm_matrix.values
+        tgm_matrix.sort_index(ascending=False, inplace=True)
         
         # 인덱스 리스트 (정렬됨)
         train_indices = tgm_matrix.index.tolist()
@@ -444,10 +749,6 @@ class Visualizer:
         
         print(f"[*] TGM Heatmap (All Labels) saved at: {save_path}")
 
-class ResultLoader:
-    def load(self):
-        pass
-
 
 def get_patch_time_ms(patch_idx, time_bin, sampling_rate, start_time_ms=-200):
     """패치 인덱스를 실제 시간(ms)으로 변환"""
@@ -485,55 +786,6 @@ def calculate_metrics(all_preds, all_labels):
         
     return acc, bal_acc, np_preds, np_labels
 
-def save_graphs(df_results, save_dir, patch_idx, patch_time_ms):
-    """
-    Temporal Generalization (Train Patch vs All Test Patches) 그래프를 그립니다.
-    """
-    plt.figure(figsize=(12, 6))
-    
-    # Standard Accuracy
-    plt.plot(df_results['test_patch_idx'], df_results['test_acc'], 
-             marker='o', label='Test Accuracy', color='blue', linewidth=2)
-    
-    # Balanced Accuracy
-    plt.plot(df_results['test_patch_idx'], df_results['test_balanced_acc'], 
-             marker='s', label='Balanced Accuracy', color='red', linestyle='--', linewidth=2)
-    
-    plt.title(f"Temporal Generalization: Train on P{patch_idx} ({patch_time_ms:.0f}ms)", fontsize=15)
-    plt.xlabel("Test Patch Index", fontsize=12)
-    plt.ylabel("Accuracy (%)", fontsize=12)
-    plt.ylim(0, 100)
-    plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.xticks(df_results['test_patch_idx'], rotation=45)
-    plt.tight_layout()
-    
-    graph_filename = f"TrainP{patch_idx}_Temporal_Gen_Acc.png"
-    graph_path = os.path.join(save_dir, graph_filename)
-    plt.savefig(graph_path)
-    plt.close()
-    print(f"Graph saved to: {graph_path}")
-
-
-def plot_confusion_matrix(labels, preds, cm_save_path, cm_title):
-    label_names = np.unique(labels)
-
-    cm = confusion_matrix(labels, preds, labels=label_names)
-
-    # Train/Test 시간 계산 (matched patch)
-    # train_time_start = START_TIME + train_patch_idx * TIME_BIN * 1000 / SAMPLING_RATE
-    # train_time_end = START_TIME + (train_patch_idx + 1) * TIME_BIN * 1000 / SAMPLING_RATE
-
-    fig_cm, ax_cm = plt.subplots(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax_cm,
-                xticklabels=[f"Class_{i}" for i in label_names],
-                yticklabels=[f"Class_{i}" for i in label_names])
-    ax_cm.set_xlabel('Predicted')
-    ax_cm.set_ylabel('True')
-    ax_cm.set_title(cm_title)
-    plt.tight_layout()
-    plt.savefig(cm_save_path, dpi=150)
-    plt.close('all')
 
 def torch_collate_fn(batch):
     """
@@ -550,112 +802,6 @@ def torch_collate_fn(batch):
     return X, y, stat, mask
 
 
-
-def build_tgm_matrix(all_model_metrics, metric_key="accuracy"):
-    """
-    [기능]
-    - 여러 모델(각기 다른 시간대에서 학습)의 메트릭을 모아 TGM Matrix 생성
-
-    [입력]
-    - all_model_metrics: dict 형태 {train_patch_idx: metrics_dict, ...}
-        - metrics_dict는 compute_metrics()의 출력
-    - metric_key: TGM에 사용할 메트릭 ("accuracy", "balanced_accuracy", "f1_macro", etc.)
-
-    [출력]
-    - tgm_matrix: np.ndarray [num_train_patches, num_test_patches]
-    - train_indices: 학습 패치 인덱스 리스트
-    - test_indices: 테스트 패치 인덱스 리스트
-    """
-    # 학습 패치 인덱스 정렬
-    train_indices = sorted(all_model_metrics.keys())
-
-    # 테스트 패치 인덱스는 첫 번째 모델의 per_patch에서 가져옴
-    first_metrics = all_model_metrics[train_indices[0]]
-    test_indices = [p["patch_idx"] for p in first_metrics["per_patch"]]
-
-    # TGM Matrix 초기화
-    num_train = len(train_indices)
-    num_test = len(test_indices)
-    tgm_matrix = np.zeros((num_train, num_test))
-
-    # Matrix 채우기
-    for i, train_idx in enumerate(train_indices):
-        metrics = all_model_metrics[train_idx]
-        for j, patch_result in enumerate(metrics["per_patch"]):
-            tgm_matrix[i, j] = patch_result[metric_key]
-
-    return tgm_matrix, train_indices, test_indices
-
-
-def plot_tgm_heatmap(config, tgm_matrix,
-                     metric_name="Accuracy", save_path="tgm_heatmap.png",
-                     vmin=None, vmax=None, cmap="viridis"):
-    """
-    [기능]
-    - TGM Matrix를 Heatmap으로 시각화
-
-    [입력]
-    - tgm_matrix: np.ndarray [num_train_patches, num_test_patches]
-    - train_indices: 학습 패치 인덱스 리스트
-    - test_indices: 테스트 패치 인덱스 리스트
-    - sampling_rate: 샘플링 레이트 (Hz)
-    - time_bin: 시간 빈 크기 (samples)
-    - start_time: 시작 시간 (ms)
-    - metric_name: 메트릭 이름 (제목용)
-    - save_path: 저장 경로
-    - vmin, vmax: 컬러맵 범위
-    - cmap: 컬러맵 종류
-
-    [출력]
-    - fig: matplotlib figure 객체
-    """
-    # # 시간 레이블 생성 (ms 단위)
-    # def patch_to_time_ms(patch_idx):
-    #     return start_time + patch_idx * time_bin * 1000 / sampling_rate
-
-    # train_labels = [f"P{idx}_{patch_to_time_ms(idx):.0f}" for idx in train_indices]
-    # test_labels = [f"P{idx}_{patch_to_time_ms(idx):.0f}" for idx in test_indices]
-
-    train_start_time, train_end_time = get_patch_time_ms(patch_idx, config["time_bin"], config["sampling_rate"], start_time_ms=config["start_time_ms"])
-    test_start_time, test_end_time = get_patch_time_ms(patch_idx, config["time_bin"], config["sampling_rate"], start_time_ms=config["start_time_ms"])
-
-    # Figure 생성
-    fig, ax = plt.subplots(figsize=(12, 10))
-
-    # Heatmap 그리기
-    sns.heatmap(
-        tgm_matrix,
-        annot=True if tgm_matrix.shape[0] <= 10 else False,  # 작은 matrix만 숫자 표시
-        fmt=".2f",
-        cmap=cmap,
-        vmin=vmin,
-        vmax=vmax,
-        xticklabels=test_labels,
-        yticklabels=train_labels,
-        ax=ax,
-        cbar_kws={"label": metric_name}
-    )
-
-    # 대각선 표시 (Train Time == Test Time)
-    ax.plot([0, min(len(test_indices), len(train_indices))],
-            [0, min(len(test_indices), len(train_indices))],
-            'r--', linewidth=2, alpha=0.7)
-
-    ax.set_xlabel(f"Test Time (ms) [{test_time_start:.0f} ~ {test_time_end:.0f}ms]", fontsize=12)
-    ax.set_ylabel(f"Train Time (ms) [{train_time_start:.0f} ~ {train_time_end:.0f}ms]", fontsize=12)
-    ax.set_title(f"Temporal Generalization Matrix ({metric_name})\n"
-                 f"Train: {train_time_start:.0f}~{train_time_end:.0f}ms | Test: {test_time_start:.0f}~{test_time_end:.0f}ms",
-                 fontsize=14)
-
-    # X축 레이블 회전
-    plt.xticks(rotation=45, ha='right')
-    plt.yticks(rotation=0)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
-    print(f"[*] TGM Heatmap saved at: {save_path}")
-
-    return fig
 
 # # data inference check!
 if __name__ == "__main__":
@@ -678,30 +824,24 @@ if __name__ == "__main__":
                 "patience": 10,
                 "n_classes": 6,
                 "is_label_null": True,
-                "skip_inference" : False,
-                "metrics":["acc", "bal_acc"]
+                "skip_pred" : False,
+                "metrics":["acc", "bal_acc"],
+                "ckpt_dir":"./EEGNet/logs",
+                "csv_input_dir":None,
 
-    } 
 
-    train_files = ['./EEG(500Hz)_COMB/processed_t                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          rain/npy/sub-14.npy']
-    
+    }
+
+    train_files = ['./EEG(500Hz)_COMB/processed_train/npy/sub-14.npy']
+
     input_len, input_ch = COMBDataset(config=config, filepath = train_files)._get_sample_info()
     # # 모델 초기화 (53채널, 448 timepoints, 5 classes)
     net = EEGNet(n_channels=input_ch, n_timepoints=input_len, n_classes=config["n_classes"]).cuda(0)
     print(f"FC input size: {net.fc_input_size}")
 
-    # Loss: CrossEntropyLoss (5-class classification)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(net.parameters())
-    
-    n_patches = input_len//config["time_bin"]
-
-
-
-    ckpt_dir = config["save_dir"]
     best_model_paths = []
-    ckpt_lists = os.listdir(ckpt_dir)
-    ckpt_lists = [d for d in ckpt_lists if os.path.isdir(os.path.join(ckpt_dir, d))]
+    ckpt_lists = os.listdir(config["ckpt_dir"])
+    ckpt_lists = [d for d in ckpt_lists if os.path.isdir(os.path.join(config["ckpt_dir"], d))]
     ckpt_lists.sort()
 
     for p in ckpt_lists:
@@ -709,7 +849,7 @@ if __name__ == "__main__":
             continue
         ckpt_best_acc = -1.0
         ckpt_best_file = None
-        patch_dir = os.path.join(ckpt_dir, p)
+        patch_dir = os.path.join(config["ckpt_dir"], p)
         ckpts = [f for f in os.listdir(patch_dir) if f.endswith(".pth")]
         for c in ckpts:
             try:
@@ -721,7 +861,8 @@ if __name__ == "__main__":
                 continue
         best_model_paths.append(os.path.join(patch_dir, ckpt_best_file))
         
-    test_config = config.copy()
-    test_config["data_dir"] = "./EEG(500Hz)_COMB/processed_test/npy"
-    test(test_config,net, best_model_paths, n_patches)
+    # test_config = config.copy()
+    # test_config["data_dir"] = "./EEG(500Hz)_COMB/processed_test/npy"
 
+    manager = InferenceManager(config = config, model = net)
+    manager.run()
