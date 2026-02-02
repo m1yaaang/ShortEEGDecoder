@@ -253,6 +253,8 @@ def process_and_save_data(subject_ids, run_ns, data_dir, output_dir, drop_chs, c
                 print(f"Error processing {subject_id} Run {run_n}: {e}")
                 continue
 
+            os.makedirs(os.path.join(output_dir, save_format), exist_ok=True)
+            
             subject_data_buffer.append(x_all)
             subject_label_buffer.append(y_all)
             save_metadata(epochs_stim.info, subject_id, os.path.join(output_dir, save_format))
@@ -276,7 +278,7 @@ if __name__ == "__main__":
 
     # data_dir = "/local_raid3/03_user/myyu/hackathon_eeg"
     data_dir = "/local_raid3/03_user/hoian/brlBandit/hackathon_eeg"
-    output_root = "/local_raid3/03_user/myyu/EEG_decoder/EEG(500Hz)_COMB"
+    output_root = "/local_raid3/03_user/myyu/EEG_decoder/EEG(256Hz)_COMB"
 
     subject_ids = os.listdir(data_dir)
     run_ns = ["01", "02", "03", "04", "05", "06", "07", "08", "09"]
@@ -291,15 +293,28 @@ if __name__ == "__main__":
     print(f"Train subjects ({len(train_subjects)}): {train_subjects}")
     print(f"Test subjects ({len(test_subjects)}): {test_subjects}")
 
+    drop_channels = ['TP9', 'TP10', 'FT9', 'FT10']
+
+    use_channels_names =[          # 57-4 = 53ch #drop_channels = ['TP9', 'TP10', 'FT9', 'FT10']
+                                    'Fpz',
+                'F7', 'F5', 'F3', 'F1', 'Fz', 'F2', 'F4', 'F6', 'F8', 
+            'FT7', 'FC5', 'FC3', 'FC1', 'FC2', 'FC4', 'FC6', 'FT8',
+                'T7', 'C5', 'C3', 'C1', 'Cz', 'C2', 'C4', 'C6', 'T8',
+            'TP7', 'CP5', 'CP3', 'CP1', 'CPz', 'CP2', 'CP4', 'CP6', 'TP8',
+                'P7', 'P5', 'P3', 'P1', 'Pz', 'P2', 'P4', 'P6', 'P8',
+                        'PO7', 'PO3', 'POz', 'PO4', 'PO8', 
+                            'O1', 'O2', 'Oz']
+
+
     process_and_save_data(
-        subject_ids=train_subjects, run_ns=run_ns, data_dir=data_dir, 
-        output_dir= os.path.join(output_root, "processed_train"), 
-        drop_chs=None, ch_order=None, resample_rate=None, save_format="npy", save_mode="subject"
+        subject_ids=train_subjects, run_ns=run_ns, data_dir=data_dir,
+        output_dir= os.path.join(output_root, "processed_train"),
+        drop_chs=drop_channels, ch_order=use_channels_names, resample_rate=256, save_format="npy", save_mode="subject"
     )
     process_and_save_data(
-        subject_ids=test_subjects, run_ns=run_ns, data_dir=data_dir, 
-        output_dir= os.path.join(output_root, "processed_test"), 
-        drop_chs=None, ch_order=None, resample_rate=None, save_format="npy", save_mode="subject"
+        subject_ids=test_subjects, run_ns=run_ns, data_dir=data_dir,
+        output_dir= os.path.join(output_root, "processed_test"),
+        drop_chs=drop_channels, ch_order=use_channels_names, resample_rate=256, save_format="npy", save_mode="subject"
     )
 
     print("Save complete.")

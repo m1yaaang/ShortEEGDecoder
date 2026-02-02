@@ -17,14 +17,6 @@ from sklearn.metrics import confusion_matrix, balanced_accuracy_score, roc_auc_s
 from tqdm import tqdm
 from EEGNet.EEGNet_util import EEGNet 
 
-# import os
-# # from EEGNet.EEGNet_util import EEGNet  <--- ����
-
-# def get_model(config):
-#     from EEGNet.EEGNet_util import EEGNet 
-    
-#     model = EEGNet(...)
-#     return model
 
 
 class BaseFileHandler(ABC):
@@ -58,27 +50,14 @@ class NpyFileHandler(BaseFileHandler):
         data = np.load(file_path, mmap_mode='r')
         return data.shape
 
+    def get_info(self, file_path):
 
-    # def _path_info(self, file_dir):
-    #     """
-    #     부모 경로에서 X, y, stats 파일 이름을 추출하는 메서드
-    #     - X_filename = sub-01.npy / sub-01_run01.npy
-    #     - y_filename = sub-01_label.npy / sub-01_run01_label.npy
-    #     - stats_filename = sub-01_stats.npy / sub-01_run01_stats.npy
+        infos_filename = file_path.replace('.npy', '_info.pkl')
+        info = pickle.load(open(infos_filename, 'rb'))      # MNE info object
+        return info
 
-    #     return: tuple: (X_filename, y_filename, stats_filename)
-    #     """
-    #     file_path = os.listdir(file_dir)
-    #     X_filename = [f for f in file_path if "label" not in f and "stats" not in f and "info" not in f]
-    #     y_filename = [f for f in file_path if "label" in f]
-    #     stats_filename = [f for f in file_path if "stats" in f]
-    #     infos_filename = [f for f in file_path if "info" in f]
+    def load_slice(self, file_path, trial_idx, start_idx, end_idx):
 
-    #     return X_filename, y_filename, stats_filename, infos_filename
-
-
-    def load_slice(self, file_path, start_idx, end_idx):
-    
         """
         file_path = os.listdir(file_path)
         X_filename = [f for f in file_path if "label" not in f]
@@ -92,14 +71,12 @@ class NpyFileHandler(BaseFileHandler):
         X_filename = file_path
         y_filename = file_path.replace('.npy', '_label.npy')
         stats_filename = file_path.replace('.npy', '_stats.npy')
-        infos_filename = file_path.replace('.npy', '_info.pkl')
 
         X = np.load(X_filename, mmap_mode ='r')
         y = np.load(y_filename, mmap_mode ='r')
         stat = np.load(stats_filename, mmap_mode ='r')           # (N_trials, n_channels, [mean, std])
-        info = pickle.load(open(infos_filename, 'rb'))      # MNE info object
 
-        return X[:, :, start_idx:end_idx], y, stat, info
+        return X[trial_idx, :, start_idx:end_idx], y[trial_idx], stat[trial_idx]
 
 # !)  수정!!!
 class PklFileHandler(BaseFileHandler):
@@ -198,11 +175,12 @@ class COMBDataset(torch.utils.data.Dataset):
         self.patch_idx = config["patch_idx"]
         self.stride = config["stride"]
         self.file_chunk_type = config["file_chunk_type"]
-
+        
         if filepath is not None:
             self.file_paths = filepath
         else:
             self.file_paths = self._find_data_files(self.data_dir, config["data_ext"])
+
 
         if config["time_bin"] is not None:
             self.time_bin = config["time_bin"]
@@ -241,6 +219,9 @@ class COMBDataset(torch.utils.data.Dataset):
             raise ValueError(f"Unsupported normalization method: {config['normalize_method']}")
 
         self.model_input_len, self.model_input_ch = self._get_sample_info()
+
+        self.trial_map = []
+        self._build_trial_map()
 
     def _find_data_files(self, data_dir, data_ext):
         """
@@ -291,8 +272,23 @@ class COMBDataset(torch.utils.data.Dataset):
         return mask_expand, full_X
 
 
+    def _build_trial_map(self):
+        """Build trial map (file_index, trial_index) for data loading"""
+        # print("[*] Building Trial Map...")
+        for f_idx, path in enumerate(self.file_paths):
+            try:
+                shape = self.file_handler.get_meta(path)
+                n_trials = shape[0] # (N_trials, Ch, Time)
+                
+                for t_idx in range(n_trials):
+                    self.trial_map.append((f_idx, t_idx))
+            except Exception as e:
+                print(f"[Warning] Error reading {path}: {e}")
+        
+        # print(f"[*] Total Trials Indexed: {len(self.trial_map)}")
+
     def __len__(self):
-        return len(self.file_paths)
+        return len(self.trial_map)
 
 
     def __getitem__(self, index):
@@ -300,15 +296,21 @@ class COMBDataset(torch.utils.data.Dataset):
         getitem 메서드는 데이터셋에서 특정 인덱스의 데이터를 가져오는 역할을 합니다.
         dataset의 필수 함수. 이걸 dataloader가 호출함.
         """
-        path = self.file_paths[index] 
+        file_idx, trial_idx = self.trial_map[index]
+        path = self.file_paths[file_idx]
+
         start, end = self.window_type(total_len=self.model_input_len)
-        X, Y, stat, _ = self.file_handler.load_slice(path, start, end)
+        X, Y, stat = self.file_handler.load_slice(path, trial_idx, start, end)
+
+        X = X[np.newaxis, :, :]        # (1, Ch, Time)
+        stat = stat[np.newaxis, :, :]  # (1, Ch, 2)
+
         mask, X = self._masking_from_window(self.model_input_len, X, start, end)
         X = self.normalizer(X, stat, mask)
 
         X = torch.from_numpy(X).float()
-        Y = torch.from_numpy(Y).long() 
-        stat = torch.from_numpy(stat).float()
+        Y = torch.tensor(Y).long().unsqueeze(0)
+        stat = torch.from_numpy(stat.copy()).float()
         mask = torch.from_numpy(mask).bool() # BoolTensor로 변환
 
         # print(f"\n[File Inspection] Loading: {os.path.basename(path)}")
@@ -347,7 +349,7 @@ class InferenceManager:
         best_model_paths = []
 
         ckpt_lists = os.listdir(self.config['ckpt_dir'])
-        ckpt_lists = [d for d in ckpt_lists if os.path.isdir(os.path.join(self.config['ckpt_dir'], d))] # 폴더 안에 logs 안에 ckpt가 있는 경우
+        # ckpt_lists = [d for d in ckpt_lists if os.path.exists(os.path.join(self.config['ckpt_dir'], d))] # 폴더 안에 logs 안에 ckpt가 있는 경우
         ckpt_lists.sort()
 
         """
@@ -382,7 +384,7 @@ class InferenceManager:
     def _calculate_num_patches(self):
         """데이터 전체 길이를 time_bin으로 나누어 총 패치 수 계산"""
         # 임시로 데이터 하나를 로드해서 전체 길이를 파악
-        temp_ds = COMBDataset(config=self.config)
+        temp_ds = COMBDataset(config=self.config, filepath=self.config["test_files"])
         total_len, _ = temp_ds._get_sample_info()
         return total_len // self.config['time_bin']
 
@@ -397,9 +399,10 @@ class InferenceManager:
         for ckpt in self.ckpt_paths:
             print(f"\n==> Evaluating Checkpoint: {ckpt}")
             train_patch_idx = self._parse_patch_from_path(ckpt)
-            train_start_ms, train_end_ms = get_patch_time_ms(train_patch_idx, config['time_bin'], config['sampling_rate'])
+            train_start_ms, train_end_ms = get_patch_time_ms(train_patch_idx, self.config['time_bin'], self.config['sampling_rate'])
             print(f"Train Patch{train_patch_idx}({train_start_ms}~{train_end_ms})")  
 
+            save_dir = os.path.dirname(ckpt).replace("checkpoints", "analysis")
             # net = None
             model = self.model
             if not self.config["skip_pred"]:
@@ -413,15 +416,15 @@ class InferenceManager:
                 #[Step 1] Data source
                 if not self.config["skip_pred"]:
                     preds,labels,probs = self.predictor.predict(model, test_patch_idx)
-                    self.recorder.save_detail_csv(ckpt, train_patch_idx, test_patch_idx, preds, labels, probs)
+                    self.recorder.save_detail_csv(save_dir, train_patch_idx, test_patch_idx, preds, labels, probs)
                 else: #Only Analysis
                     preds,labels,probs = self.loader.load_csv(train_patch_idx, test_patch_idx)
 
                 #[Step 2] Evaluation
-                metrics  = self.evaluator.compute_metrics(preds, labels, probs, params=config["metrics"])
+                metrics  = self.evaluator.compute_metrics(preds, labels, probs, params=self.config["metrics"])
 
                 #[Step 3] Visualization (CM)
-                self.visualizer.plot_cm(ckpt, labels, preds, train_patch_idx, test_patch_idx, metrics['acc'])
+                self.visualizer.plot_cm(save_dir, labels, preds, train_patch_idx, test_patch_idx, metrics['acc'])
 
                 #[Step 4] TGM Data Collection
                 global_tgm_data.append({
@@ -439,11 +442,11 @@ class InferenceManager:
         # [Step 5] Final TGM Plotting 
         if global_tgm_data:
             df_summary = pd.DataFrame(global_tgm_data)
-            self.recorder.save_summary_csv(df_summary)
+            self.recorder.save_summary_csv(df_summary, save_dir=save_dir)
 
             # TGM 시각화 (Acc, Bal_Acc)
-            self.visualizer.plot_tgm(ckpt, df_summary, metric_key='test_acc')
-            self.visualizer.plot_tgm(ckpt, df_summary, metric_key='test_bal_acc')
+            self.visualizer.plot_tgm(ckpt, df_summary, metric_key='test_acc', save_dir=save_dir)
+            self.visualizer.plot_tgm(ckpt, df_summary, metric_key='test_bal_acc', save_dir=save_dir)
 
         return
 
@@ -481,7 +484,7 @@ class Predictor:
         test_config = self.config.copy()
         test_config["patch_idx"] = test_patch_idx
 
-        test_patch_dataset = COMBDataset(config=test_config)
+        test_patch_dataset = COMBDataset(config=test_config, filepath=test_config["test_files"])
         test_patch_loader = torch.utils.data.DataLoader(
                                             test_patch_dataset,
                                             batch_size=self.config["batch_size"],
@@ -500,8 +503,12 @@ class Predictor:
             for inputs, labels, _, _ in test_patch_loader:
                 inputs = inputs.cuda(0)
                 outputs = model(inputs)
-                probs = F.softmax(outputs, dim=1)
-                preds = torch.argmax(outputs, dim=1)
+                if isinstance(outputs, tuple) or isinstance(outputs, list):
+                    logits = outputs[-1]  # Get the last output as Logits (h)
+                else:
+                    logits = outputs
+                probs = F.softmax(logits, dim=1)
+                preds = torch.argmax(logits, dim=1)
 
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.numpy())
@@ -607,8 +614,8 @@ class Recorder:
         self.sr = config["sampling_rate"]
         self.save_dir = config["save_dir"]
 
-    def save_detail_csv(self, ckpt, train_patch_idx, test_patch_idx, preds, labels, probs):
-        csv_dir = os.path.join(os.path.dirname(ckpt),'csv')
+    def save_detail_csv(self, save_dir, train_patch_idx, test_patch_idx, preds, labels, probs):
+        csv_dir = os.path.join(save_dir,'csv')
         os.makedirs(csv_dir, exist_ok=True)
         csv_filename = f"TrainP{train_patch_idx}_TestP{test_patch_idx}_results.csv"
         csv_save_path = os.path.join(csv_dir, csv_filename)
@@ -645,19 +652,23 @@ class Visualizer:
         self.time_bin = config["time_bin"]
         self.sr = config["sampling_rate"]
 
-    def plot_cm(self, ckpt, labels, preds, train_patch_idx, test_patch_idx, final_acc):
+    def plot_cm(self, save_dir, labels, preds, train_patch_idx, test_patch_idx, final_acc,epoch=None):
 
         train_start_ms, train_end_ms = get_patch_time_ms(train_patch_idx, self.time_bin, self.sr)
         test_start_ms, test_end_ms = get_patch_time_ms(test_patch_idx, self.time_bin, self.sr)
-        
-        cm_dir = os.path.join(os.path.dirname(ckpt),'cm')
+
+        cm_dir = os.path.join(save_dir, 'cm')
         os.makedirs(cm_dir, exist_ok=True)
 
         # Confusion Matrix 저장
-        cm_filename = f"TrainP{train_patch_idx}_TestP{test_patch_idx}_Acc{final_acc:.2f}_cm.png"
-        cm_save_path = os.path.join(cm_dir, cm_filename)
+        if epoch == None: 
+            cm_title = f"Train P{train_patch_idx}({train_start_ms}~{train_end_ms}) / Test P{test_patch_idx}({test_start_ms}~{test_end_ms})\nAcc: {final_acc:.2f}%"
+            cm_filename = f"TrainP{train_patch_idx}_TestP{test_patch_idx}_Acc{final_acc:.2f}_cm.png"
+        else:
+            cm_title = f"Train P{train_patch_idx}({train_start_ms}~{train_end_ms}) / Test P{test_patch_idx}({test_start_ms}~{test_end_ms})Epoch{epoch}\nAcc: {final_acc:.2f}%"
+            cm_filename = f"TrainP{train_patch_idx}_TestP{test_patch_idx}_Epoch{epoch}_Acc{final_acc:.2f}_cm.png"
 
-        cm_title = f"Train P{train_patch_idx}({train_start_ms}~{train_end_ms}) / Test P{test_patch_idx}({test_start_ms}~{test_end_ms})\nAcc: {final_acc:.2f}%"
+        cm_save_path = os.path.join(cm_dir, cm_filename)
         label_names = np.unique(labels)
 
         cm = confusion_matrix(labels, preds, labels=label_names)
@@ -674,7 +685,7 @@ class Visualizer:
         plt.tight_layout()
         plt.savefig(cm_save_path, dpi=150)
         plt.close('all')
-        return 
+        return fig_cm
 
 
     def plot_tgm(self, ckpt, df, metric_key='test_acc', save_dir=None):
@@ -803,66 +814,66 @@ def torch_collate_fn(batch):
 
 
 
-# # data inference check!
-if __name__ == "__main__":
-    config = {
-                "data_dir": "./EEG(500Hz)_COMB/processed_test/npy",
-                "batch_size": 4,
-                "num_workers": 0,
-                "shuffle": True,
-                "sampling_rate": 500,
-                "start_time_ms" : -200,
-                "data_ext": "npy",
-                "window_type": "fixed",  # "fixed" or "random"
-                "time_bin": 32,
-                "file_chunk_type": "subject", # "subject" or "run"
-                "normalize_method": "zscore", # "zscore" or "minmax"
-                "patch_idx": None,
-                "stride": None,
-                "save_dir": "EEGNet/logs",
-                "num_epochs": 100,
-                "patience": 10,
-                "n_classes": 6,
-                "is_label_null": True,
-                "skip_pred" : False,
-                "metrics":["acc", "bal_acc"],
-                "ckpt_dir":"./EEGNet/logs",
-                "csv_input_dir":None,
+# # # data inference check!
+# if __name__ == "__main__":
+#     config = {
+#                 "data_dir": "./EEG(500Hz)_COMB/processed_test/npy",
+#                 "batch_size": 4,
+#                 "num_workers": 0,
+#                 "shuffle": True,
+#                 "sampling_rate": 500,
+#                 "start_time_ms" : -200,
+#                 "data_ext": "npy",
+#                 "window_type": "fixed",  # "fixed" or "random"
+#                 "time_bin": 32,
+#                 "file_chunk_type": "subject", # "subject" or "run"
+#                 "normalize_method": "zscore", # "zscore" or "minmax"
+#                 "patch_idx": None,
+#                 "stride": None,
+#                 "save_dir": "EEGNet/logs",
+#                 "num_epochs": 100,
+#                 "patience": 10,
+#                 "n_classes": 6,
+#                 "is_label_null": True,
+#                 "skip_pred" : False,
+#                 "metrics":["acc", "bal_acc"],
+#                 "ckpt_dir":"./EEGNet/logs",
+#                 "csv_input_dir":None,
 
 
-    }
+#     }
 
-    train_files = ['./EEG(500Hz)_COMB/processed_train/npy/sub-14.npy']
+#     train_files = ['./EEG(500Hz)_COMB/processed_train/npy/sub-14.npy']
 
-    input_len, input_ch = COMBDataset(config=config, filepath = train_files)._get_sample_info()
-    # # 모델 초기화 (53채널, 448 timepoints, 5 classes)
-    net = EEGNet(n_channels=input_ch, n_timepoints=input_len, n_classes=config["n_classes"]).cuda(0)
-    print(f"FC input size: {net.fc_input_size}")
+#     input_len, input_ch = COMBDataset(config=config, filepath = train_files)._get_sample_info()
+#     # # 모델 초기화 (53채널, 448 timepoints, 5 classes)
+#     net = EEGNet(n_channels=input_ch, n_timepoints=input_len, n_classes=config["n_classes"]).cuda(0)
+#     print(f"FC input size: {net.fc_input_size}")
 
-    best_model_paths = []
-    ckpt_lists = os.listdir(config["ckpt_dir"])
-    ckpt_lists = [d for d in ckpt_lists if os.path.isdir(os.path.join(config["ckpt_dir"], d))]
-    ckpt_lists.sort()
+#     best_model_paths = []
+#     ckpt_lists = os.listdir(config["ckpt_dir"])
+#     ckpt_lists = [d for d in ckpt_lists if os.path.isdir(os.path.join(config["ckpt_dir"], d))]
+#     ckpt_lists.sort()
 
-    for p in ckpt_lists:
-        if "None" in p:
-            continue
-        ckpt_best_acc = -1.0
-        ckpt_best_file = None
-        patch_dir = os.path.join(config["ckpt_dir"], p)
-        ckpts = [f for f in os.listdir(patch_dir) if f.endswith(".pth")]
-        for c in ckpts:
-            try:
-                c_acc = float(c.split("_acc=")[-1].replace(".pth",""))
-                if c_acc > ckpt_best_acc:
-                    ckpt_best_acc = c_acc
-                    ckpt_best_file = c
-            except:
-                continue
-        best_model_paths.append(os.path.join(patch_dir, ckpt_best_file))
+#     for p in ckpt_lists:
+#         if "None" in p:
+#             continue
+#         ckpt_best_acc = -1.0
+#         ckpt_best_file = None
+#         patch_dir = os.path.join(config["ckpt_dir"], p)
+#         ckpts = [f for f in os.listdir(patch_dir) if f.endswith(".pth")]
+#         for c in ckpts:
+#             try:
+#                 c_acc = float(c.split("_acc=")[-1].replace(".pth",""))
+#                 if c_acc > ckpt_best_acc:
+#                     ckpt_best_acc = c_acc
+#                     ckpt_best_file = c
+#             except:
+#                 continue
+#         best_model_paths.append(os.path.join(patch_dir, ckpt_best_file))
         
-    # test_config = config.copy()
-    # test_config["data_dir"] = "./EEG(500Hz)_COMB/processed_test/npy"
+#     # test_config = config.copy()
+#     # test_config["data_dir"] = "./EEG(500Hz)_COMB/processed_test/npy"
 
-    manager = InferenceManager(config = config, model = net)
-    manager.run()
+#     manager = InferenceManager(config = config, model = net)
+#     manager.run()

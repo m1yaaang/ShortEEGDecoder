@@ -21,7 +21,7 @@ import numpy as np
 import gc
 import logging
 from tqdm import tqdm
-# from utils import COMBDataset, calculate_metrics, get_patch_time_ms, torch_collate_fn, plot_confusion_matrix, save_graphs
+# from utils_my import COMBDataset, calculate_metrics, get_patch_time_ms, torch_collate_fn, plot_confusion_matrix, save_graphs
 from sklearn.model_selection import KFold
 
 class EEGNet(nn.Module):

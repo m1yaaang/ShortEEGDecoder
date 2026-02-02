@@ -21,7 +21,7 @@ import numpy as np
 import gc
 import logging
 from tqdm import tqdm
-from utils import COMBDataset, calculate_metrics, get_patch_time_ms, torch_collate_fn, plot_confusion_matrix, save_graphs
+from utils_my import COMBDataset, calculate_metrics, get_patch_time_ms, torch_collate_fn, plot_confusion_matrix, save_graphs
 from sklearn.model_selection import KFold
 
 class EEGNet(nn.Module):
@@ -470,8 +470,7 @@ if __name__ == "__main__":
     optimizer = optim.Adam(net.parameters())
     
     n_patches = input_len//config["time_bin"]
-
-
+    
     k_folds = 2 
     kfold = KFold(n_splits=k_folds, shuffle=True, random_state=42)
     # ------------------config---------------------------
@@ -481,46 +480,46 @@ if __name__ == "__main__":
     # 폴드 결과 저장
     fold_results = []
 
-    # # -------------------------------------------------------
-    # # Loop 1: K fold
-    # # -------------------------------------------------------
-    # for fold, (train_ids, val_ids) in enumerate(kfold.split(train_files)):
-    # # for fold in range(1):
+    # -------------------------------------------------------
+    # Loop 1: K fold
+    # -------------------------------------------------------
+    for fold, (train_ids, val_ids) in enumerate(kfold.split(train_files)):
+    # for fold in range(1):
         
-    #     current_fold = fold + 1
-    #     print(f"\n" + "="*40)
-    #     print(f"[:] Starting Fold {current_fold}/{k_folds}")
-    #     print("="*40)
+        current_fold = fold + 1
+        print(f"\n" + "="*40)
+        print(f"[:] Starting Fold {current_fold}/{k_folds}")
+        print("="*40)
 
-    #     # Patch Loop (5부터 시작)
-    #     for patch_idx in range(n_patches):
+        # Patch Loop (5부터 시작)
+        for patch_idx in range(n_patches):
 
-    #         train_files_fold = [train_files[i] for i in train_ids]
-    #         val_files_fold = [train_files[i] for i in val_ids]
+            train_files_fold = [train_files[i] for i in train_ids]
+            val_files_fold = [train_files[i] for i in val_ids]
             
-    #         config["patch_idx"] = patch_idx
+            config["patch_idx"] = patch_idx
 
-    #         train_dataset = COMBDataset(config=config, file_path = train_files_fold)
-    #         train_loader = torch.utils.data.DataLoader(
-    #                                             train_dataset, 
-    #                                             batch_size=config["batch_size"], 
-    #                                             shuffle=config["shuffle"], 
-    #                                             num_workers=config["num_workers"],
-    #                                             collate_fn = torch_collate_fn,)
+            train_dataset = COMBDataset(config=config, file_path = train_files_fold)
+            train_loader = torch.utils.data.DataLoader(
+                                                train_dataset, 
+                                                batch_size=config["batch_size"], 
+                                                shuffle=config["shuffle"], 
+                                                num_workers=config["num_workers"],
+                                                collate_fn = torch_collate_fn,)
 
-    #         # test_config = config.copy()
-    #         # test_config["data_dir"] = "./EEG(500Hz)_COMB/processed_test/npy"
+            # test_config = config.copy()
+            # test_config["data_dir"] = "./EEG(500Hz)_COMB/processed_test/npy"
 
-    #         val_dataset = COMBDataset(config=config, file_path = val_files_fold)
-    #         val_loader = torch.utils.data.DataLoader(
-    #                                             val_dataset, 
-    #                                             batch_size=config["batch_size"], 
-    #                                             shuffle=config["shuffle"], 
-    #                                             num_workers=config["num_workers"],
-    #                                             collate_fn = torch_collate_fn,)
+            val_dataset = COMBDataset(config=config, file_path = val_files_fold)
+            val_loader = torch.utils.data.DataLoader(
+                                                val_dataset, 
+                                                batch_size=config["batch_size"], 
+                                                shuffle=config["shuffle"], 
+                                                num_workers=config["num_workers"],
+                                                collate_fn = torch_collate_fn,)
 
 
-    #         train_single_patch(config, net, criterion, optimizer, train_loader, val_loader)
+            train_single_patch(config, net, criterion, optimizer, train_loader, val_loader)
 
     # -------------------------------------------------------
     # Loop 2: Test all best models
