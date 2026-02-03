@@ -3,12 +3,15 @@ import sys
 import os
 import torch
 from datetime import datetime
-from EEGPT.finetune_EEGPT_combine_LoRA_util import LitEEGPTCausal_LoRA
-from utils_my import InferenceManager, COMBDataset
+from EEGPT.finetune_EEGPT_combine_LoRA_conv_within_util import LitEEGPTCausal_LoRA, WithinSubjectDataset
+from utils_my import InferenceManager, COMBDataset, torch_collate_fn, get_patch_time_ms
+import torch.nn.functional as F
+import numpy as np
 import re
 
 class EEGPTInference(InferenceManager):
-    def __init__(self, config, model):
+    def __init__(self, config, model, test_trial_indices=None):
+        self.test_trial_indices = test_trial_indices
         super().__init__(config, model)
     def _discover_checkpoints(self):
 
@@ -25,12 +28,14 @@ class EEGPTInference(InferenceManager):
         all_dirs = os.listdir(root_ckpt_dir)
         model_ckpt_list = []
         for m in all_dirs:
-            parts = m.split("_")
-            # 폴더명이 날짜로 시작하고, 길이가 충분하며, 조건을 만족하는지 확인
-            if (parts[0].isdigit() 
-                and int(parts[0]) >= infer_date 
-                and len(parts) > 3 
-                and parts[3] == "F1"):
+            # parts = m.split("_")
+            # # 폴더명이 날짜로 시작하고, 길이가 충분하며, 조건을 만족하는지 확인
+            # if (parts[0].isdigit() 
+            #     and int(parts[0]) >= infer_date 
+            #     and len(parts) > 3 
+            #     and parts[3] == "F1"):
+            #     model_ckpt_list.append(m)
+            if m == '20260203_1429_LORA_F1_P5_CAll':
                 model_ckpt_list.append(m)
         
         model_ckpt_list.sort()

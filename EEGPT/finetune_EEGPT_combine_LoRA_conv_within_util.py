@@ -20,7 +20,7 @@ import pandas as pd
 import tqdm
 from functools import partial
 from datetime import datetime
-from sklearn.model_selection import KFold
+# from sklearn.model_selection import KFold  # Not used for within-subject
 from sklearn.metrics import confusion_matrix, accuracy_score
 from sklearn.metrics import precision_recall_curve
 from torchmetrics.classification import BinaryAUROC, BinaryF1Score
@@ -35,8 +35,94 @@ from Modules.models.EEGPT_mcae import EEGTransformer
 from Modules.Network.utils import Conv1dWithConstraint, LinearWithConstraint
 from peft import LoraConfig, get_peft_model
 from utils_my import COMBDataset, InferenceManager, torch_collate_fn, Evaluator, Visualizer
+from sklearn.model_selection import train_test_split
 
 matplotlib.use('Agg')
+
+
+class WithinSubjectDataset(COMBDataset):
+    """
+    COMBDataset을 상속받아 trial 단위로 train/test split을 지원하는 Dataset.
+    피험자 한 명의 npy 파일 내에서 trial을 나눠서 학습/검증에 사용.
+    """
+    def __init__(self, config, filepath=None, trial_indices=None):
+        """
+        Args:
+            config: 기존 config
+            filepath: 데이터 파일 경로 (list)
+            trial_indices: 사용할 trial의 인덱스 리스트 (None이면 전체 사용)
+        """
+        self.selected_trial_indices = trial_indices
+        super().__init__(config, filepath)
+
+    def _build_trial_map(self):
+        """
+        trial_map을 빌드할 때, selected_trial_indices가 있으면 해당 인덱스만 사용
+        """
+        for f_idx, path in enumerate(self.file_paths):
+            try:
+                shape = self.file_handler.get_meta(path)
+                n_trials = shape[0]
+
+                if self.selected_trial_indices is not None:
+                    # 선택된 trial만 사용
+                    for t_idx in self.selected_trial_indices:
+                        if t_idx < n_trials:
+                            self.trial_map.append((f_idx, t_idx))
+                else:
+                    # 전체 trial 사용
+                    for t_idx in range(n_trials):
+                        self.trial_map.append((f_idx, t_idx))
+            except Exception as e:
+                print(f"[Warning] Error reading {path}: {e}")
+
+    @staticmethod
+    def split_trials(config, filepath, val_size=0.2, test_size=0.2, random_state=42):
+        """
+        trial 인덱스를 train/val/test로 나눠서 반환
+
+        Args:
+            config: dataset config
+            filepath: 데이터 파일 경로 (list)
+            val_size: validation set 비율 (default: 0.2)
+            test_size: test set 비율 (default: 0.2)
+            random_state: random seed (default: 42)
+
+        Returns:
+            train_indices, val_indices, test_indices: train/val/test에 사용할 trial 인덱스 리스트
+        """
+        from utils_my import NpyFileHandler
+
+        file_handler = NpyFileHandler()
+        total_trials = 0
+
+        # 전체 trial 수 계산
+        for path in filepath:
+            shape = file_handler.get_meta(path)
+            total_trials += shape[0]
+
+        all_indices = list(range(total_trials))
+
+        # 먼저 train+val / test 분리
+        train_val_indices, test_indices = train_test_split(
+            all_indices,
+            test_size=test_size,
+            random_state=random_state,
+            shuffle=True
+        )
+
+        # train+val에서 train / val 분리
+        # val_size는 전체 대비 비율이므로 train_val 내에서의 비율로 변환
+        val_ratio_in_trainval = val_size / (1 - test_size)
+        train_indices, val_indices = train_test_split(
+            train_val_indices,
+            test_size=val_ratio_in_trainval,
+            random_state=random_state,
+            shuffle=True
+        )
+
+        print(f"[*] Trial Split: Total={total_trials}, Train={len(train_indices)}, Val={len(val_indices)}, Test={len(test_indices)}")
+        return train_indices, val_indices, test_indices
 # INSTALL `pip install peft`
 
 def seed_torch(seed=1029):
@@ -214,7 +300,7 @@ class LitEEGPTCausal_LoRA(pl.LightningModule):       # !) Transformer(encoder ->
 
         # init model
         target_encoder = EEGTransformer(
-            img_size=[self.input_ch, self.input_len],          # ? 256hz * 30 sec = num of datapoint
+            img_size=[self.input_ch, 64],          # ? 256hz * 30 sec = num of datapoint
             patch_size=32*2,                        
             patch_stride = 8,
             embed_num=self.embed_num,
@@ -260,7 +346,7 @@ class LitEEGPTCausal_LoRA(pl.LightningModule):       # !) Transformer(encoder ->
             print("[*] Skipped loading checkpoint(Init blank model)")
 
         self.chan_conv       = Conv1dWithConstraint(self.input_ch, self.input_ch, 1, max_norm=1)
-        
+       
         # -------------LoRA---------------------------
         # CHANGE target_modules
 
@@ -341,6 +427,9 @@ class LitEEGPTCausal_LoRA(pl.LightningModule):       # !) Transformer(encoder ->
         # B, C, T = x.shape   # C=53, T=256
         x = self.chan_conv(x)
         x = x*mask.to(self.device)
+        indices = torch.where(mask[0,0]==1)[0]
+        x = x[:, :, indices]   # [B, 53, 16]
+        x = F.interpolate(x, size=64, mode='linear', align_corners = True)
         # 2. pass through Encoder
         # ?) shape of z = [Batch_size, Patch_num, 512] 
         # = # z shape: [Batch, 97, 512] (N=97는 stride=2 때문에 생긴 결과)
@@ -360,28 +449,30 @@ class LitEEGPTCausal_LoRA(pl.LightningModule):       # !) Transformer(encoder ->
         # if len(z.shape) == 4:
         #     z=z.flatten(2)
 
-        # --------------------------------
-        #          Masking Part
-        # --------------------------------
-        B, N, C, D = z.shape #[8, 21, 4, 512]
-        if mask is not None:
-            if mask.dtype == torch.bool:
-                mask = mask.float()
-            patch_mask = F.adaptive_max_pool1d(mask, output_size = N)
-            patch_mask, _ = patch_mask.max(dim=1)
-        else:
-            patch_mask = None   
-        print(patch_mask[0])
-        # 3. Flatten
-        # h = z.flatten(2)
-        # h = z.mean(dim=1)
+        # # --------------------------------
+        # #          Masking Part
+        # # --------------------------------
+        # B, N, C, D = z.shape #[8, 21, 4, 512]
+        # if mask is not None:
+        #     if mask.dtype == torch.bool:
+        #         mask = mask.float()
+        #     patch_mask = F.adaptive_max_pool1d(mask, output_size = N)
+        #     patch_mask, _ = patch_mask.max(dim=1)
+        # else:
+        #     patch_mask = None   
+        # print(patch_mask[0])
+        # # 3. Flatten
+        # # h = z.flatten(2)
+        # # h = z.mean(dim=1)
         # z_flattened = z.flatten(2)  #[B, N, C*D]
-        h, attn_weight = self.pooler(z_flattened,mask=patch_mask)
+        # h, attn_weight = self.pooler(z_flattened,mask=patch_mask)
 
-        print(torch.isnan(h).any())
-        print(f"h mean:{h.mean().item()}")  # chekc if it is NaN or 0
+        # print(torch.isnan(h).any())
+        # print(f"h mean:{h.mean().item()}")  # chekc if it is NaN or 0
 
+        # h = z.squeeze(1).mean(dim=1)    
         # 4. classification(MLP method)
+        h = z.flatten(1)
         h = self.head(h)
 
         # x is raw data for logging, h is prediction
@@ -465,11 +556,11 @@ class LitEEGPTCausal_LoRA(pl.LightningModule):       # !) Transformer(encoder ->
             # 3-1. Prediction(Argmax)
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
             preds = torch.argmax(logits, dim=-1).cpu().numpy()
-            # print(f"DEBUG: {labels.shape}, {preds.shape}, {probs.shape}")
+            print(f"DEBUG: {labels.shape}, {preds.shape}, {probs.shape}")
         probs = torch.softmax(logits, dim=-1).cpu().numpy()
         labels = labels.reshape(-1)
         preds = preds.reshape(-1)
-        # print(f"DEBUG: {labels.shape}, {preds.shape}, {probs.shape}")
+        print(f"DEBUG: {labels.shape}, {preds.shape}, {probs.shape}")
         metric_results = self.evaluator.compute_metrics(
             preds=preds, 
             labels=labels, 
@@ -614,7 +705,7 @@ if __name__ == "__main__":
     else:
         print("⚡ [Training Mode] Using DDP Strategy")
         # 평소 실행(python ~)일 땐: 원래대로 DDP 사용
-        strategy = 'ddp'
+        strategy = 'ddp_find_unused_parameters_true'
         devices = 'auto' # 또는 [0, 1]
         num_workers = 16  # 원래 설정
 
@@ -658,25 +749,18 @@ if __name__ == "__main__":
     # IS_DEBUG = True
     target_cls = 2
 
-    k_folds = 2
-    # k_folds = 5
-    kfold = KFold(n_splits=k_folds, shuffle=True, random_state=42)
     # ------------------config---------------------------
 
     train_dir = os.path.join(config["data_dir"], "processed_train/npy")
     test_dir = os.path.join(config["data_dir"], "processed_test/npy")
 
+    # sub-46 파일만 사용 (Within-Subject)
     train_files = [
-            os.path.join(train_dir, f) for f in os.listdir(train_dir) 
-            if "label" not in f and "stats" not in f and "info" not in f
+            os.path.join(train_dir, f) for f in os.listdir(train_dir)
+            if "label" not in f and "stats" not in f and "info" not in f and "sub-46" in f
         ]
-    
-    test_files = [
-            os.path.join(test_dir, f) for f in os.listdir(test_dir) 
-            if "label" not in f and "stats" not in f and "info" not in f
-        ]
-    
-    config["test_files"] = test_files
+
+    config["test_files"] = train_files
     input_len, input_ch = COMBDataset(config=config, filepath = train_files)._get_sample_info()
     n_patches = input_len//config["time_bin"]
 
@@ -686,188 +770,172 @@ if __name__ == "__main__":
 
     train_date = datetime.now().strftime('%Y%m%d_%H%M')
 
-    # 폴드 결과 저장
-    fold_results = []
+    # -------------------------------------------------------
+    # Trial-level Split (Within-Subject): Train / Val / Test
+    # -------------------------------------------------------
+    train_trial_indices, val_trial_indices, test_trial_indices = WithinSubjectDataset.split_trials(
+        config=config,
+        filepath=train_files,
+        val_size=0.2,
+        test_size=0.2,
+        random_state=42
+    )
+
+    print(f"\n" + "="*40)
+    print(f"[:] Within-Subject Training (sub-46)")
+    print(f"    Train Trials: {len(train_trial_indices)}")
+    print(f"    Val Trials: {len(val_trial_indices)}")
+    print(f"    Test Trials: {len(test_trial_indices)}")
+    print("="*40)
 
     # -------------------------------------------------------
-    # Loop 1: K fold
+    # Loop: Patches (For Each Time Bin)
     # -------------------------------------------------------
-    for fold, (train_ids, val_ids) in enumerate(kfold.split(train_files)):
-    # for fold in range(1):
-        
-        current_fold = fold + 1
-        print(f"\n" + "="*40)
-        print(f"[:] Starting Fold {current_fold}/{k_folds}")
-        print("="*40)
+    #FIXME - DEBUG(patch)
+    # for patch_idx in range(n_patches):
+    for patch_idx in range(6,7):
 
+        target_cls = 'All'
+        ##FIXME - CONFIG(project name)
+        # ------------------config---------------------------
+        experiment_name = f"LORA_Within_sub-46_P{patch_idx}_C{target_cls}"
+        exp_id = f"{train_date}_{experiment_name}"
+        print(f"[*] Experiment ID: {exp_id}")
+        print(f"[*] Mode: {'DEBUG (Overfit 1 batch)' if IS_DEBUG else 'TRAINING'}")
 
-        # -------------------------------------------------------
-        # Loop 2: Patches (For Each Time Bin)
-        # -------------------------------------------------------
-        #FIXME - DEBUG(patch)
-        # for patch_idx in range(n_patches):
-        for patch_idx in range(5,6):
-                
-            train_files_fold = [train_files[i] for i in train_ids]
-            val_files_fold = [train_files[i] for i in val_ids]
-            
-            target_cls = 'All'
-            ##FIXME - CONFIG(project name)
-            # ------------------config---------------------------
-            experiment_name = f"LORA_F{current_fold}_P{patch_idx}_C{target_cls}"
-            exp_id = f"{train_date}_{experiment_name}"
-            print(f"[*] Experiment ID: {exp_id}")
-            print(f"[*] Mode: {'DEBUG (Overfit 1 batch)' if IS_DEBUG else 'TRAINING'}")
+        base_dir = f"./EEGPT/logs/{exp_id}/"
+        ckpt_dir = os.path.join(base_dir,"checkpoints")
+        analysis_dir = os.path.join(base_dir,"analysis")
 
-            base_dir = f"./EEGPT/logs/{exp_id}/"
-            ckpt_dir = os.path.join(base_dir,"checkpoints")
-            analysis_dir = os.path.join(base_dir,"analysis")
+        config["save_dir"] = analysis_dir
+        config["ckpt_dir"] = ckpt_dir
 
-            config["save_dir"] = analysis_dir
-            config["ckpt_dir"] = ckpt_dir
+        os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(analysis_dir, exist_ok=True)
 
-            os.makedirs(ckpt_dir, exist_ok=True)
-            os.makedirs(analysis_dir, exist_ok=True)
+        print(f"  Training Class:{target_cls}")
+        print(f"  Patch Index: {patch_idx}")
 
-            print(f"  Training Class:{target_cls}")
-            print(f"  Patch Index: {patch_idx}")
+        config["patch_idx"] = patch_idx
 
-            config["patch_idx"] = patch_idx
+        # Within-Subject: trial 인덱스로 split된 Dataset 사용
+        train_dataset = WithinSubjectDataset(config=config, filepath=train_files, trial_indices=train_trial_indices)
+        train_loader = torch.utils.data.DataLoader(
+                                            train_dataset,
+                                            batch_size=config["batch_size"],
+                                            shuffle=config["shuffle"],
+                                            num_workers=config["num_workers"],
+                                            collate_fn = torch_collate_fn,)
 
-            train_dataset = COMBDataset(config=config, filepath = train_files_fold)
-            train_loader = torch.utils.data.DataLoader(
-                                                train_dataset, 
-                                                batch_size=config["batch_size"], 
-                                                shuffle=config["shuffle"], 
-                                                num_workers=config["num_workers"],
-                                                collate_fn = torch_collate_fn,)
+        val_dataset = WithinSubjectDataset(config=config, filepath=train_files, trial_indices=val_trial_indices)
+        val_loader = torch.utils.data.DataLoader(
+                                            val_dataset,
+                                            batch_size=config["batch_size"],
+                                            shuffle=False,
+                                            num_workers=config["num_workers"],
+                                            collate_fn = torch_collate_fn,
+                                            persistent_workers=True)
 
-            val_dataset = COMBDataset(config=config, filepath = val_files_fold)
-            val_loader = torch.utils.data.DataLoader(
-                                                val_dataset, 
-                                                batch_size=config["batch_size"], 
-                                                shuffle=False, 
-                                                num_workers=config["num_workers"],
-                                                collate_fn = torch_collate_fn,
-                                                persistent_workers=True)
+        # Note: test_trial_indices는 run_EEGPT_inference.py에서 사용
 
-            #ANCHOR - Training
-            # -- begin Training ------------------------------
+        #ANCHOR - Training
+        # -- begin Training ------------------------------
 
-            torch.set_float32_matmul_precision('medium' )
+        torch.set_float32_matmul_precision('medium' )
 
-            # 4-3. init model(MultiClass)
-            model = LitEEGPTCausal_LoRA(
-                config = config,
-                fixed_train_patch_idx=patch_idx, 
-            )
-            # print(model)
-            wandb_logger = WandbLogger(
-                                project="eegpt_combine3_LoRa_util", 
-                                name=experiment_name,
-                                group= experiment_name, 
-                                id = exp_id,
-                                tags=[f"Fold{experiment_name}",f"Patch{patch_idx}",f"Class{target_cls}","Masking", exp_id, f"Timebin{config['time_bin']}"],
-                                save_dir=base_dir
-                                )
+        # 4-3. init model(MultiClass)
+        model = LitEEGPTCausal_LoRA(
+            config = config,
+            fixed_train_patch_idx=patch_idx,
+        )
+        # print(model)
+        wandb_logger = WandbLogger(
+                            project="eegpt_combine3_LoRa_util_within",
+                            name=experiment_name,
+                            group= experiment_name,
+                            id = exp_id,
+                            tags=[f"Within{experiment_name}",f"Patch{patch_idx}",f"Class{target_cls}","Masking", exp_id, f"Timebin{config['time_bin']}"],
+                            save_dir=base_dir
+                            )
 
-            # wandb_logger.experiment.config.update({"max_epochs": max_epochs})
-            # -------------------config--------------------------
+        # wandb_logger.experiment.config.update({"max_epochs": max_epochs})
+        # -------------------config--------------------------
 
-            # 4-4. Loggers
+        # 4-4. Loggers
+
+        # most basic trainer, uses good defaults (auto-tensorboard, checkpoints, logs, and more)
+        lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='epoch')
+
+        checkpoint_filename = f"{experiment_name}-{{epoch:02d}}-{{valid_loss:.4f}}"
+
+        checkpoint_callback = ModelCheckpoint(
+            monitor='valid_loss',
+            mode='min',
+            save_top_k=5,
+            save_last=True,
+            filename=f"{experiment_name}-{{epoch:02d}}-{{valid_loss:.4f}}",
+            verbose=False,
+            dirpath=ckpt_dir,
+        )
+
+        early_stop_callback = EarlyStopping(
+            monitor = 'valid_loss',
+            min_delta = 0.00,
+            patience = 5,
+            verbose=True,
+            mode='min'
+        )
+
+        callbacks = [lr_monitor, checkpoint_callback, early_stop_callback]
+
+        if is_debugging():
+            logger=[pl_loggers.CSVLogger(base_dir, name="EEGPT_COMBINE_csv")]
+
+        else:
             wandb_logger.watch(model, log="all", log_graph=True, log_freq=100)
-            # most basic trainer, uses good defaults (auto-tensorboard, checkpoints, logs, and more)
-            lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='epoch')
-
-            checkpoint_filename = f"{experiment_name}_Fold{current_fold}-{{epoch:02d}}-{{valid_loss:.4f}}"
-
-            checkpoint_callback = ModelCheckpoint(
-                monitor='valid_loss',
-                mode='min',
-                save_top_k=5,
-                save_last=True,
-                filename=f"{experiment_name}-{{epoch:02d}}-{{valid_loss:.4f}}",  
-                verbose=False,
-                dirpath=ckpt_dir,
-            )
-
-            early_stop_callback = EarlyStopping(
-                monitor = 'valid_loss',
-                min_delta = 0.00,
-                patience = 5,
-                verbose=True,
-                mode='min'
-            )
-                        
-            callbacks = [lr_monitor, checkpoint_callback, early_stop_callback]
-
-            if is_debugging():
-                logger=[pl_loggers.CSVLogger(base_dir, name="EEGPT_COMBINE_csv")]
-
-            else:
-                logger=[wandb_logger, 
-                        pl_loggers.CSVLogger(base_dir, name="EEGPT_COMBINE_csv")]
+            logger=[wandb_logger,
+                    pl_loggers.CSVLogger(base_dir, name="EEGPT_COMBINE_csv")]
 
 
-            ''' 
-            !) pl.Trainer is for LightningModule 
-            
-            1. manage hardware => accelerator
-            2. optimization => Mixed Precision
-            3. Manage Train loop => max_epoch
-            4. Logging => logger
-            5. checkpoint, learning Rate monitor -> callback
-            '''
+        '''
+        !) pl.Trainer is for LightningModule
+
+        1. manage hardware => accelerator
+        2. optimization => Mixed Precision
+        3. Manage Train loop => max_epoch
+        4. Logging => logger
+        5. checkpoint, learning Rate monitor -> callback
+        '''
 
 
 
-            #FIXME - Trainer
-            trainer = pl.Trainer(accelerator='cuda',
-                                devices=devices,
-                                strategy=strategy,
-                                sync_batchnorm=True,
-                                precision=16,
-                                max_epochs=config["num_epochs"], 
-                                accumulate_grad_batches = config["accumulate_grad_batches"],
-                                callbacks=callbacks,
-                                enable_progress_bar=True,
-                                num_sanity_val_steps=0,
-                                check_val_every_n_epoch=1 if IS_DEBUG else 10,
-                                limit_val_batches=0.25,
-                                logger=logger)
+        #FIXME - Trainer
+        trainer = pl.Trainer(accelerator='cuda',
+                            devices=devices,
+                            strategy=strategy,
+                            sync_batchnorm=True,
+                            precision=16,
+                            max_epochs=config["num_epochs"],
+                            accumulate_grad_batches = config["accumulate_grad_batches"],
+                            callbacks=callbacks,
+                            enable_progress_bar=True,
+                            num_sanity_val_steps=0,
+                            check_val_every_n_epoch=1 if IS_DEBUG else 10,
+                            # limit_val_batches=0.25,
+                            logger=logger)
 
+        trainer.fit(model, train_loader, val_loader)
 
+        wandb.finish()
 
-            trainer.fit(model, train_loader, val_loader)
+        wandb_logger.experiment.finish()
+        del model, trainer, train_loader, val_loader
+        torch.cuda.empty_cache()
 
-            wandb.finish()
-
-            wandb_logger.experiment.finish()
-            del model, trainer, train_loader, val_loader
-            torch.cuda.empty_cache()
-                
-        # -------------------------------------------------------
-        # END Loop 2: Patches (For Each Time Bin)
-        # -------------------------------------------------------
-    if not IS_DEBUG and fold_results:
-        print(f"\n[!] {k_folds}-Fold CV Finished.")
-        print(f"Average Val Loss: {np.mean(fold_results):.4f}")
-
-    # # 4. Best Model Inference
-
-    # if not IS_DEBUG: # INFERENCE
-    # best_ckpt_path = trainer.checkpoint_callback.best_model_path
-    # print(f"Best Model saved at: {best_ckpt_path}")
-
-    # # 3. OverLoad Best Model Checkpoint
-    # best_checkpoint = torch.load(best_ckpt_path)
-    # model.load_state_dict(best_checkpoint['state_dict']) 
-
-    # model.eval()
-    # model.cuda()
-    # manager = InferenceManager(config, model = LitEEGPTCausal_LoRA)
-    # manager.run()
-    
+    # -------------------------------------------------------
+    # END Loop: Patches (For Each Time Bin)
+    # -------------------------------------------------------
+    print(f"\n[!] Within-Subject Training Finished.")
 
 #!SECTION
 #endregion [!] MAIN

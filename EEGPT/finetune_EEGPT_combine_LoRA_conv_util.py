@@ -214,7 +214,7 @@ class LitEEGPTCausal_LoRA(pl.LightningModule):       # !) Transformer(encoder ->
 
         # init model
         target_encoder = EEGTransformer(
-            img_size=[self.input_ch, self.input_len],          # ? 256hz * 30 sec = num of datapoint
+            img_size=[self.input_ch, 64],          # ? 256hz * 30 sec = num of datapoint
             patch_size=32*2,                        
             patch_stride = 8,
             embed_num=self.embed_num,
@@ -260,7 +260,7 @@ class LitEEGPTCausal_LoRA(pl.LightningModule):       # !) Transformer(encoder ->
             print("[*] Skipped loading checkpoint(Init blank model)")
 
         self.chan_conv       = Conv1dWithConstraint(self.input_ch, self.input_ch, 1, max_norm=1)
-        
+       
         # -------------LoRA---------------------------
         # CHANGE target_modules
 
@@ -341,6 +341,9 @@ class LitEEGPTCausal_LoRA(pl.LightningModule):       # !) Transformer(encoder ->
         # B, C, T = x.shape   # C=53, T=256
         x = self.chan_conv(x)
         x = x*mask.to(self.device)
+        indices = torch.where(mask[0,0]==1)[0]
+        x = x[:, :, indices]   # [B, 53, 16]
+        x = F.interpolate(x, size=64, mode='linear', align_corners = True)
         # 2. pass through Encoder
         # ?) shape of z = [Batch_size, Patch_num, 512] 
         # = # z shape: [Batch, 97, 512] (N=97는 stride=2 때문에 생긴 결과)
@@ -360,28 +363,30 @@ class LitEEGPTCausal_LoRA(pl.LightningModule):       # !) Transformer(encoder ->
         # if len(z.shape) == 4:
         #     z=z.flatten(2)
 
-        # --------------------------------
-        #          Masking Part
-        # --------------------------------
-        B, N, C, D = z.shape #[8, 21, 4, 512]
-        if mask is not None:
-            if mask.dtype == torch.bool:
-                mask = mask.float()
-            patch_mask = F.adaptive_max_pool1d(mask, output_size = N)
-            patch_mask, _ = patch_mask.max(dim=1)
-        else:
-            patch_mask = None   
-        print(patch_mask[0])
-        # 3. Flatten
-        # h = z.flatten(2)
-        # h = z.mean(dim=1)
+        # # --------------------------------
+        # #          Masking Part
+        # # --------------------------------
+        # B, N, C, D = z.shape #[8, 21, 4, 512]
+        # if mask is not None:
+        #     if mask.dtype == torch.bool:
+        #         mask = mask.float()
+        #     patch_mask = F.adaptive_max_pool1d(mask, output_size = N)
+        #     patch_mask, _ = patch_mask.max(dim=1)
+        # else:
+        #     patch_mask = None   
+        # print(patch_mask[0])
+        # # 3. Flatten
+        # # h = z.flatten(2)
+        # # h = z.mean(dim=1)
         # z_flattened = z.flatten(2)  #[B, N, C*D]
-        h, attn_weight = self.pooler(z_flattened,mask=patch_mask)
+        # h, attn_weight = self.pooler(z_flattened,mask=patch_mask)
 
-        print(torch.isnan(h).any())
-        print(f"h mean:{h.mean().item()}")  # chekc if it is NaN or 0
+        # print(torch.isnan(h).any())
+        # print(f"h mean:{h.mean().item()}")  # chekc if it is NaN or 0
 
+        # h = z.squeeze(1).mean(dim=1)    
         # 4. classification(MLP method)
+        h = z.flatten(1)
         h = self.head(h)
 
         # x is raw data for logging, h is prediction
@@ -465,11 +470,11 @@ class LitEEGPTCausal_LoRA(pl.LightningModule):       # !) Transformer(encoder ->
             # 3-1. Prediction(Argmax)
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
             preds = torch.argmax(logits, dim=-1).cpu().numpy()
-            # print(f"DEBUG: {labels.shape}, {preds.shape}, {probs.shape}")
+            print(f"DEBUG: {labels.shape}, {preds.shape}, {probs.shape}")
         probs = torch.softmax(logits, dim=-1).cpu().numpy()
         labels = labels.reshape(-1)
         preds = preds.reshape(-1)
-        # print(f"DEBUG: {labels.shape}, {preds.shape}, {probs.shape}")
+        print(f"DEBUG: {labels.shape}, {preds.shape}, {probs.shape}")
         metric_results = self.evaluator.compute_metrics(
             preds=preds, 
             labels=labels, 
@@ -614,7 +619,7 @@ if __name__ == "__main__":
     else:
         print("⚡ [Training Mode] Using DDP Strategy")
         # 평소 실행(python ~)일 땐: 원래대로 DDP 사용
-        strategy = 'ddp'
+        strategy = 'ddp_find_unused_parameters_true'
         devices = 'auto' # 또는 [0, 1]
         num_workers = 16  # 원래 설정
 
@@ -775,7 +780,7 @@ if __name__ == "__main__":
             # -------------------config--------------------------
 
             # 4-4. Loggers
-            wandb_logger.watch(model, log="all", log_graph=True, log_freq=100)
+            
             # most basic trainer, uses good defaults (auto-tensorboard, checkpoints, logs, and more)
             lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='epoch')
 
@@ -805,6 +810,7 @@ if __name__ == "__main__":
                 logger=[pl_loggers.CSVLogger(base_dir, name="EEGPT_COMBINE_csv")]
 
             else:
+                wandb_logger.watch(model, log="all", log_graph=True, log_freq=100)
                 logger=[wandb_logger, 
                         pl_loggers.CSVLogger(base_dir, name="EEGPT_COMBINE_csv")]
 

@@ -500,9 +500,9 @@ class Predictor:
         all_probs = []
         
         with torch.no_grad():
-            for inputs, labels, _, _ in test_patch_loader:
+            for inputs, labels, _, mask in test_patch_loader:
                 inputs = inputs.cuda(0)
-                outputs = model(inputs)
+                outputs = model(inputs, mask=mask)
                 if isinstance(outputs, tuple) or isinstance(outputs, list):
                     logits = outputs[-1]  # Get the last output as Logits (h)
                 else:
