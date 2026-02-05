@@ -573,8 +573,11 @@ class LitEEGPTCausal_LoRA(pl.LightningModule):       # !) Transformer(encoder ->
         # 4. Confusion Matrix
         should_log_image = (self.current_epoch + 1) % 10 == 0
         if should_log_image and isinstance(self.logger, WandbLogger) and self.global_rank == 0:
-            fig = self.visualizer.plot_cm(self.hparams.config["save_dir"],  labels, preds,
-                                    self.hparams.config["patch_idx"], self.hparams.config["patch_idx"],
+            #(N,) vs (N,) For Safty
+            # if preds.ndim >1: preds = preds.squeeze()
+            # if labels.ndim >1: labels = labels.squeeze()
+            fig = self.visualizer.plot_cm(config["save_dir"],  labels, preds, 
+                                    config["patch_idx"], config["patch_idx"], 
                                     metric_results['acc'], epoch=self.current_epoch+1)
             self.logger.experiment.log({
                         "valid/confusion_matrix_img": wandb.Image(fig),

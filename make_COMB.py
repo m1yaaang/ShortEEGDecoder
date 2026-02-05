@@ -278,7 +278,7 @@ if __name__ == "__main__":
 
     # data_dir = "/local_raid3/03_user/myyu/hackathon_eeg"
     data_dir = "/local_raid3/03_user/hoian/brlBandit/hackathon_eeg"
-    output_root = "/local_raid3/03_user/myyu/EEG_decoder/EEG(256Hz)_COMB"
+    output_root = "/local_raid3/03_user/myyu/EEG_decoder/EEG(500Hz)_53ch"
 
     subject_ids = os.listdir(data_dir)
     run_ns = ["01", "02", "03", "04", "05", "06", "07", "08", "09"]
@@ -309,12 +309,12 @@ if __name__ == "__main__":
     process_and_save_data(
         subject_ids=train_subjects, run_ns=run_ns, data_dir=data_dir,
         output_dir= os.path.join(output_root, "processed_train"),
-        drop_chs=drop_channels, ch_order=use_channels_names, resample_rate=256, save_format="npy", save_mode="subject"
+        drop_chs=drop_channels, ch_order=use_channels_names, resample_rate=None, save_format="npy", save_mode="subject"
     )
     process_and_save_data(
         subject_ids=test_subjects, run_ns=run_ns, data_dir=data_dir,
         output_dir= os.path.join(output_root, "processed_test"),
-        drop_chs=drop_channels, ch_order=use_channels_names, resample_rate=256, save_format="npy", save_mode="subject"
+        drop_chs=drop_channels, ch_order=use_channels_names, resample_rate=None, save_format="npy", save_mode="subject"
     )
 
     print("Save complete.")
