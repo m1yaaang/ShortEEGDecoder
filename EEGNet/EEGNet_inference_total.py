@@ -16,13 +16,17 @@ import os
 import pickle
 import re
 import sys
+from collections import defaultdict
 
 import matplotlib
 matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 import torch
 import torch.nn.functional as F
+from sklearn.metrics import confusion_matrix, balanced_accuracy_score, accuracy_score
 from tqdm import tqdm
 
 from utils_data import (discover_all_subjects, WithinSubjectDatasetTotal,
@@ -307,7 +311,6 @@ class EEGNetWithinInferenceTotal:
     def _plot_diagonal_best_epoch(self, df_best, subject_id, save_dir,
                                    filename_prefix=None):
         """Best-epoch diagonal accuracy plot (plot_best_epoch_diagonal.py style)."""
-        import matplotlib.pyplot as plt
         diag = df_best[df_best['train_patch_idx'] == df_best['test_patch_idx']].copy()
         diag = diag.sort_values('train_patch_idx').reset_index(drop=True)
         time_ms = diag['train_time_ms'].values
@@ -407,6 +410,182 @@ class EEGNetWithinInferenceTotal:
         print(f"\n[!] Cross-Subject Analysis → {combined_dir}")
 
     # ----------------------------------------------------------
+    # Cross-subject CM: best-epoch 모델로 re-inference → 전체 피험자 CM
+    # ----------------------------------------------------------
+    def generate_cross_subject_cm(self):
+        """Cross-subject confusion matrix: per-patch best-epoch predictions aggregated."""
+        root_dir = self.config["ckpt_dir"]
+        output_dir = os.path.join(root_dir, "avg_cm")
+        os.makedirs(output_dir, exist_ok=True)
+
+        subject_files_map = discover_all_subjects(self.config["data_dir"])
+        n_classes = self.config.get("n_classes", 6)
+
+        # Get patch info
+        first_subject = sorted(subject_files_map.keys())[0]
+        first_files = subject_files_map[first_subject]
+        self.config["test_files"] = first_files
+        input_len, _ = COMBDataset(
+            config=self.config, filepath=first_files)._get_sample_info()
+        num_patches = self._calculate_num_patches(input_len)
+
+        patch_times = {}
+        for p_idx in range(num_patches):
+            t_ms, _ = get_patch_time_ms_stride(
+                p_idx, self.time_bin, self.stride,
+                self.config['sampling_rate'])
+            patch_times[p_idx] = t_ms
+
+        # Discover subjects
+        subjects = sorted([d for d in os.listdir(root_dir)
+                           if d.startswith("sub-") and
+                           os.path.isdir(os.path.join(root_dir, d))])
+
+        print(f"\n[*] Cross-Subject CM: {len(subjects)} subjects, {num_patches} patches")
+
+        patch_preds = defaultdict(list)
+        patch_labels = defaultdict(list)
+
+        for subj in tqdm(subjects, desc="CM Subjects"):
+            csv_path = os.path.join(root_dir, subj, "combined_analysis",
+                                    f"{subj}_all_summary.csv")
+            if not os.path.exists(csv_path):
+                continue
+            if subj not in subject_files_map:
+                continue
+
+            df = pd.read_csv(csv_path)
+            diag = df[df['train_patch_idx'] == df['test_patch_idx']].copy()
+            diag['_valid_loss'] = diag['ckpt_name'].apply(self._parse_valid_loss)
+            best = diag.loc[diag.groupby('train_patch_idx')['_valid_loss'].idxmin()]
+            best_entries = best[['train_patch_idx', 'epoch', 'ckpt_name']].values.tolist()
+
+            subject_files = subject_files_map[subj]
+            self.config["test_files"] = subject_files
+
+            _, _, test_trial_indices = WithinSubjectDatasetTotal.split_trials(
+                config=self.config, filepath=subject_files,
+                val_size=0.2, test_size=0.2, random_state=42)
+
+            subject_dir = os.path.join(root_dir, subj)
+            shared_cache = {}
+
+            for train_patch_idx, epoch, ckpt_name in best_entries:
+                train_patch_idx = int(train_patch_idx)
+                # Find checkpoint
+                ckpt_path = None
+                for exp_name in os.listdir(subject_dir):
+                    ckpt_dir_path = os.path.join(subject_dir, exp_name, "checkpoints")
+                    if not os.path.exists(ckpt_dir_path):
+                        continue
+                    full_path = os.path.join(ckpt_dir_path, ckpt_name + ".ckpt")
+                    if os.path.exists(full_path):
+                        ckpt_path = full_path
+                        break
+                if ckpt_path is None:
+                    continue
+
+                model = self._load_model(ckpt_path)
+                if model is None:
+                    continue
+
+                ds = self._create_dataset(
+                    subject_files, test_trial_indices,
+                    train_patch_idx, shared_cache)
+                preloaded = self._preload_to_tensors(ds)
+                del ds
+
+                preds, labels, _ = self._predict(model, preloaded)
+                patch_preds[train_patch_idx].append(preds)
+                patch_labels[train_patch_idx].append(labels)
+                del preloaded
+
+            del shared_cache
+            torch.cuda.empty_cache()
+
+        # Generate per-patch CMs
+        print(f"\n[*] Generating per-patch CMs...")
+        label_names = np.arange(n_classes)
+        all_preds_global = []
+        all_labels_global = []
+        patch_results = []
+
+        for p_idx in sorted(patch_preds.keys()):
+            preds_all = np.concatenate(patch_preds[p_idx])
+            labels_all = np.concatenate(patch_labels[p_idx])
+            n_subj = len(patch_preds[p_idx])
+
+            cm = confusion_matrix(labels_all, preds_all, labels=label_names)
+            row_sums = cm.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1
+            cm_norm = cm.astype(float) / row_sums * 100
+
+            acc = accuracy_score(labels_all, preds_all) * 100
+            bal_acc = balanced_accuracy_score(labels_all, preds_all) * 100
+            time_ms = patch_times.get(p_idx, 0)
+
+            fig, ax = plt.subplots(figsize=(8, 7))
+            cm_vmin = np.floor(cm_norm.min() / 5) * 5
+            cm_vmax = np.ceil(cm_norm.max() / 5) * 5
+            sns.heatmap(cm_norm, annot=True, fmt='.1f', cmap='Blues', ax=ax,
+                        vmin=cm_vmin, vmax=cm_vmax,
+                        xticklabels=[f"Class_{i}" for i in label_names],
+                        yticklabels=[f"Class_{i}" for i in label_names])
+            ax.set_xlabel('Predicted')
+            ax.set_ylabel('True')
+            ax.set_title(f"P{p_idx} ({time_ms:.0f}ms) Best-Epoch CM (n={n_subj})\n"
+                         f"Acc={acc:.2f}%, Bal_Acc={bal_acc:.2f}%")
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir,
+                        f"P{p_idx:03d}_{time_ms:.0f}ms_cm_norm.png"), dpi=150)
+            plt.close()
+
+            patch_results.append({
+                'patch_idx': p_idx, 'time_ms': time_ms,
+                'acc': acc, 'bal_acc': bal_acc, 'n_subjects': n_subj
+            })
+            all_preds_global.extend(preds_all)
+            all_labels_global.extend(labels_all)
+
+        # Overall CM
+        all_preds_global = np.array(all_preds_global)
+        all_labels_global = np.array(all_labels_global)
+        cm_total = confusion_matrix(all_labels_global, all_preds_global,
+                                    labels=label_names)
+        row_sums = cm_total.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        cm_total_norm = cm_total.astype(float) / row_sums * 100
+
+        acc_total = accuracy_score(all_labels_global, all_preds_global) * 100
+        bal_acc_total = balanced_accuracy_score(
+            all_labels_global, all_preds_global) * 100
+
+        fig, ax = plt.subplots(figsize=(8, 7))
+        cm_vmin = np.floor(cm_total_norm.min() / 5) * 5
+        cm_vmax = np.ceil(cm_total_norm.max() / 5) * 5
+        sns.heatmap(cm_total_norm, annot=True, fmt='.1f', cmap='Blues', ax=ax,
+                    vmin=cm_vmin, vmax=cm_vmax,
+                    xticklabels=[f"Class_{i}" for i in label_names],
+                    yticklabels=[f"Class_{i}" for i in label_names])
+        ax.set_xlabel('Predicted')
+        ax.set_ylabel('True')
+        ax.set_title(f"All Patches Best-Epoch CM (n={len(subjects)})\n"
+                     f"Acc={acc_total:.2f}%, Bal_Acc={bal_acc_total:.2f}%")
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir,
+                    "all_patches_overall_cm_norm.png"), dpi=150)
+        plt.close()
+
+        # Summary CSV
+        df_results = pd.DataFrame(patch_results)
+        df_results.to_csv(os.path.join(output_dir,
+                          "per_patch_cm_summary.csv"), index=False)
+
+        print(f"\n[*] Overall: acc={acc_total:.2f}%, bal_acc={bal_acc_total:.2f}%")
+        print(f"[*] Generated {len(patch_results)} per-patch CMs + 1 overall CM")
+        print(f"[!] CM Output → {output_dir}")
+
+    # ----------------------------------------------------------
     # Reprocess: 기존 CSV에서 best-epoch 분석만 재생성
     # ----------------------------------------------------------
     def reprocess_subject(self, subject_id):
@@ -478,6 +657,7 @@ class EEGNetWithinInferenceTotal:
                 torch.cuda.empty_cache()
 
         self.generate_cross_subject_tgm()
+        self.generate_cross_subject_cm()
 
 
 if __name__ == "__main__":
@@ -570,6 +750,7 @@ if __name__ == "__main__":
 
     if args.cross_subject_only:
         manager.generate_cross_subject_tgm()
+        manager.generate_cross_subject_cm()
     else:
         manager.run(target_subjects=args.subject, force=args.force)
 

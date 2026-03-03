@@ -717,12 +717,19 @@ class Visualizer:
 
         # 3. Plotting
         plt.figure(figsize=(15, 13)) # 라벨이 많으므로 그림 크기를 넉넉하게 잡음
-        
+
+        # Colorbar 범위를 5% 단위로 스냅
+        data_min = np.nanmin(tgm_matrix.values)
+        data_max = np.nanmax(tgm_matrix.values)
+        vmin = np.floor(data_min / 5) * 5
+        vmax = np.ceil(data_max / 5) * 5
+
         ax = sns.heatmap(
             tgm_matrix.values,
             annot=False,            # 칸이 빽빽하면 숫자가 겹치므로 False 권장 (필요시 True)
             fmt=".1f",
             cmap="viridis",
+            vmin=vmin, vmax=vmax,
             xticklabels=test_labels, # [수정] 모든 라벨 리스트를 직접 전달
             yticklabels=train_labels, # [수정] 모든 라벨 리스트를 직접 전달
             cbar_kws={"label": metric_key}

@@ -1,40 +1,52 @@
 """
-원본 코드:https://github.com/aliasvishnu/EEGNet/blob/master/EEGNet-PyTorch.ipynb
+원본 코드:https://github.com/vlawhern/arl-eegmodels/blob/master/EEGModels.py#L224
+-> 논문 코드 그대로임.
 
-EEGNet within-subject training (per-patch, per-subject).
+EEGNet within-subject training ver2 (per-patch, per-subject).
+
+Changes from ver1:
+  - Original EEGNet architecture (Lawhern et al. 2018)
+    : Temporal Conv → BN → DepthwiseConv (spatial) → BN → ELU → AvgPool → Dropout
+    : SeparableConv (Depthwise+Pointwise) → BN → ELU → AvgPool → Dropout
+    : max_norm constraint: DepthwiseConv(1.0), FC(0.25)
+    : F1=8, D=2, F2=16, dropout=0.5
+  - AdamW + CosineAnnealingLR (lr scheduling)
+  - batch_size default: 1024 -> 128
+  - patience default: 5 -> 15
+  - label_smoothing: 0.1
+  - weight_decay: 1e-2
 
 Usage:
   # 전체 subject, 기본 설정
-  python EEGNet/EEGNet_total.py
+  python EEGNet/EEGNet_total_ver2.py
 
   # 특정 subject만
-  python EEGNet/EEGNet_total.py --subject sub-22 sub-70
+  python EEGNet/EEGNet_total_ver2.py --subject sub-22 sub-70
 
   # stride, time_bin 변경
-  python EEGNet/EEGNet_total.py --stride 4 --time_bin 16
+  python EEGNet/EEGNet_total_ver2.py --stride 4 --time_bin 16
 
   # batch_size, epochs, patience 변경
-  python EEGNet/EEGNet_total.py --batch_size 512 --epochs 300 --patience 10
+  python EEGNet/EEGNet_total_ver2.py --batch_size 256 --epochs 300 --patience 10
 
   # resume 비활성화 (처음부터 학습)
-  python EEGNet/EEGNet_total.py --no_resume
+  python EEGNet/EEGNet_total_ver2.py --no_resume
 
   # GPU 지정
-  python EEGNet/EEGNet_total.py --devices 0 1
+  python EEGNet/EEGNet_total_ver2.py --devices 0 1
 
   # 데이터 디렉토리 변경
-  python EEGNet/EEGNet_total.py --data_dir ./EEG(500Hz)_53ch
+  python EEGNet/EEGNet_total_ver2.py --data_dir ./EEG(500Hz)_53ch
 """
 
-# python EEGNet/EEGNet_total.py --no_resume --devices 0 --patch_size 16
+# python EEGNet/EEGNet_total_ver2.py --no_resume --devices 0 --patch_size 16
 
 from sklearn.metrics import confusion_matrix, balanced_accuracy_score, roc_auc_score, precision_score, recall_score, accuracy_score
 from torch.autograd import Variable
 import copy
-import matplotlib.pyplot as plt
 import numpy as np
 import os
-import pandas as pd 
+import pandas as pd
 import pickle
 import random
 import seaborn as sns
@@ -44,14 +56,12 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import matplotlib
-matplotlib.use('Agg') # 서버 환경에서 GUI 창 띄우지 않음 (멈춤 방지)
-import matplotlib.pyplot as plt 
-import pandas as pd
-import numpy as np
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import gc
 import logging
 from tqdm import tqdm
-from utils_data import WithinSubjectDatasetTotal,discover_all_subjects, torch_collate_fn
+from utils_data import WithinSubjectDatasetTotal, discover_all_subjects, torch_collate_fn
 from utils_infer import InferenceManager
 from utils_my import COMBDataset
 from sklearn.model_selection import KFold
@@ -66,95 +76,104 @@ from pytorch_lightning.loggers import WandbLogger
 import wandb
 from datetime import datetime
 
+
 class EEGNet(nn.Module):
-    def __init__(self, n_channels=53, n_timepoints=448, n_classes=6):
-        super(EEGNet, self).__init__()
-        self.T = n_timepoints
-        self.C = n_channels
-        self.n_classes = n_classes
+    """Original EEGNet (Lawhern et al. 2018) - PyTorch implementation.
 
-        # [Layer 1] Spatial Conv (공간 필터)
-        # n_channels개 채널의 정보를 하나로 압축
-        # Input: (Batch, 1, T, C) -> Output: (Batch, 16, T, 1)
-        self.conv1 = nn.Conv2d(1, 16, (1, n_channels), padding=0)
-        self.batchnorm1 = nn.BatchNorm2d(16, False)
+    Reference: https://github.com/vlawhern/arl-eegmodels
 
-        # [Layer 2] Temporal Conv (시간 필터)
-        self.conv2 = nn.Conv2d(1, 4, (2, 32),padding='same')
-        self.batchnorm2 = nn.BatchNorm2d(4, False)
-        self.pooling2 = nn.MaxPool2d(2, 4)
+    Architecture:
+      Block 1: Conv2D(temporal) → BN → DepthwiseConv2D(spatial) → BN → ELU → AvgPool → Dropout
+      Block 2: SeparableConv2D → BN → ELU → AvgPool → Dropout
+      Classifier: Flatten → FC
 
-        # [Layer 3] Depthwise/Separable Conv 
-        self.conv3 = nn.Conv2d(4, 4, (8, 4), padding='same')
-        self.batchnorm3 = nn.BatchNorm2d(4, False)
-        self.pooling3 = nn.MaxPool2d((2, 4))
+    Input: (B, C, T) where C=n_channels, T=n_timepoints
+    """
+    def __init__(self, n_channels=53, n_timepoints=64, n_classes=6,
+                 F1=8, D=2, kern_length=None, dropout_rate=0.5):
+        super().__init__()
+        F2 = F1 * D
 
-        # FC Layer 차원 계산
+        if kern_length is None:
+            kern_length = max(n_timepoints // 2, 4)
+
+        # Adaptive pool sizes based on temporal length
+        if n_timepoints >= 64:
+            p1, p2 = 4, 8   # 원본과 동일 (total 32x)
+        elif n_timepoints >= 32:
+            p1, p2 = 4, 4   # total 16x
+        else:
+            p1, p2 = 2, 4   # total 8x (patch_size=16 → 16/8=2)
+
+        # Block 1 - Temporal Conv
+        self.conv1 = nn.Conv2d(1, F1, (1, kern_length), padding='same', bias=False)
+        self.batchnorm1 = nn.BatchNorm2d(F1)
+
+        # Block 1 - Depthwise Conv (Spatial)
+        # groups=F1 → 각 temporal filter가 독립적으로 spatial filter 학습
+        self.depthwise = nn.Conv2d(F1, F2, (n_channels, 1), groups=F1, bias=False)
+        self.batchnorm2 = nn.BatchNorm2d(F2)
+        self.pooling1 = nn.AvgPool2d((1, p1))
+        self.dropout1 = nn.Dropout(dropout_rate)
+
+        # Block 2 - Separable Conv (Depthwise + Pointwise)
+        self.sep_depthwise = nn.Conv2d(F2, F2, (1, 16), padding='same', groups=F2, bias=False)
+        self.sep_pointwise = nn.Conv2d(F2, F2, (1, 1), bias=False)
+        self.batchnorm3 = nn.BatchNorm2d(F2)
+        self.pooling2 = nn.AvgPool2d((1, p2))
+        self.dropout2 = nn.Dropout(dropout_rate)
+
+        # Classifier
         self._calculate_fc_input_size(n_channels, n_timepoints)
-
-        # FC Layer - n_classes 출력 (5-class classification)
         self.fc1 = nn.Linear(self.fc_input_size, n_classes)
 
     def _calculate_fc_input_size(self, n_channels, n_timepoints):
         """Forward pass를 통해 FC layer 입력 크기 계산"""
-        with torch.no_grad(): 
-            x = torch.zeros(1, 1, n_timepoints, n_channels)
-            
-            # 2. Layer 1 (Spatial)
-            x = self.conv1(x)
-            x = x.permute(0, 3, 1, 2) # (Batch, 16, n_channels, n_timepoints) ������ ����
-            
-            # 3. Layer 2 (Temporal) 
-            x = self.conv2(x) 
+        with torch.no_grad():
+            x = torch.zeros(1, 1, n_channels, n_timepoints)
+            # Block 1
+            x = self.batchnorm1(self.conv1(x))
+            x = F.elu(self.batchnorm2(self.depthwise(x)))
+            x = self.pooling1(x)
+            # Block 2
+            x = self.sep_pointwise(self.sep_depthwise(x))
+            x = F.elu(self.batchnorm3(x))
             x = self.pooling2(x)
-            
-            # 4. Layer 3 (Depthwise)
-            x = self.conv3(x)
-            x = self.pooling3(x)
-            
-            # 5. FC Input Size 
             self.fc_input_size = x.numel()
 
-    def forward(self, x, mask = None, patch_size = None):
+    def forward(self, x, mask=None, patch_size=None):
+        # Mask & interpolate
+        indices = torch.where(mask[0, 0] == 1)[0]
+        x = x[:, :, indices]   # [B, C, time_bin]
+        x = F.interpolate(x, size=patch_size, mode='linear', align_corners=True)
 
-        indices = torch.where(mask[0,0]==1)[0]
-        x = x[:, :, indices]   # [B, 53, 16]
-        x = F.interpolate(x, size=patch_size, mode='linear', align_corners = True)
-
-        # Layer 1: Spatial Learning
+        # (B, C, T) → (B, 1, C, T)
         if x.ndim == 3:
-            x = x.unsqueeze(1).permute(0, 1, 3, 2)      # (B, 1, T, C)
+            x = x.unsqueeze(1)
 
-        x = F.elu(self.conv1(x))
-        x = self.batchnorm1(x)
-        x = F.dropout(x, 0.25, training=self.training)
-        x = x.permute(0, 3, 1, 2)                   # (?, C, B, T)
+        # Block 1: Temporal → Spatial
+        x = self.batchnorm1(self.conv1(x))          # (B, F1, C, T)
+        x = F.elu(self.batchnorm2(self.depthwise(x)))  # (B, F2, 1, T)
+        x = self.dropout1(self.pooling1(x))          # (B, F2, 1, T//p1)
 
-        # Layer 2: Temporal Learning 
-        x = F.elu(self.conv2(x))
-        x = self.batchnorm2(x)
-        x = F.dropout(x, 0.25, training=self.training)
-        x = self.pooling2(x)
+        # Block 2: Separable Conv
+        x = self.sep_pointwise(self.sep_depthwise(x))  # (B, F2, 1, T//p1)
+        x = F.elu(self.batchnorm3(x))
+        x = self.dropout2(self.pooling2(x))          # (B, F2, 1, T//(p1*p2))
 
-        # Layer 3: High-level Feature Learning 
-        x = F.elu(self.conv3(x))
-        x = self.batchnorm3(x)
-        x = F.dropout(x, 0.25, training=self.training)
-        x = self.pooling3(x)
-
-        # FC Layer
+        # Classifier
         x = x.reshape(x.size(0), -1)
-        x = self.fc1(x)  # CrossEntropyLoss에서 softmax 처리
+        x = self.fc1(x)
         return x
 
 
 class LitEEGNet(pl.LightningModule):
-    """EEGNet을 PyTorch Lightning으로 감싼 Wrapper"""
+    """EEGNet Lightning Wrapper (ver2: Original architecture + AdamW + CosineAnnealing + LabelSmoothing)"""
     def __init__(self, n_channels, n_timepoints, n_classes, config):
         super().__init__()
         self.save_hyperparameters()
         self.model = EEGNet(n_channels, n_timepoints, n_classes)
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
         self.config = config
 
     def forward(self, x, mask=None, patch_size=None):
@@ -178,35 +197,53 @@ class LitEEGNet(pl.LightningModule):
         self.log('valid_acc', acc, on_epoch=True, on_step=False, sync_dist=True, prog_bar=True)
         return loss
 
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """max_norm constraint (원본 EEGNet과 동일)"""
+        with torch.no_grad():
+            # DepthwiseConv: max_norm(1.0)
+            w = self.model.depthwise.weight
+            norms = w.view(w.size(0), -1).norm(dim=1).clamp(min=1e-8)
+            scale = (torch.clamp(norms, max=1.0) / norms).view(-1, 1, 1, 1)
+            w.data *= scale
+
+            # FC: max_norm(0.25)
+            w = self.model.fc1.weight
+            norms = w.norm(dim=1).clamp(min=1e-8)
+            scale = (torch.clamp(norms, max=0.25) / norms).unsqueeze(1)
+            w.data *= scale
+
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=1e-3)
-        return optimizer
+        optimizer = optim.AdamW(self.parameters(), lr=1e-3, weight_decay=1e-2)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.config["num_epochs"]
+        )
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
 
 def evaluate(model, data_loader, params=["acc"]):
     """Multi-class classification용 evaluate 함수"""
     model.eval()
     results = []
-    
+
     all_preds = []
     all_labels = []
     all_probs = []
-    
+
     with torch.no_grad():
         for inputs, labels, _, mask in data_loader:
             inputs = inputs.cuda(0)
             outputs = model(inputs)
             probs = F.softmax(outputs, dim=1)
             preds = torch.argmax(outputs, dim=1)
-            
+
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.numpy())
             all_probs.extend(probs.cpu().numpy())
-    
+
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
-    
+
     for param in params:
         if param == 'acc':
             results.append(accuracy_score(all_labels, all_preds))
@@ -227,7 +264,7 @@ def evaluate(model, data_loader, params=["acc"]):
                 results.append(2 * precision * recall / (precision + recall))
             else:
                 results.append(0.0)
-    
+
     model.train()
     return results, all_preds, all_labels
 
@@ -261,7 +298,7 @@ def find_completed_patches(subject_dir):
 
 def parse_args():
     import argparse
-    parser = argparse.ArgumentParser(description="EEGNet within-subject training")
+    parser = argparse.ArgumentParser(description="EEGNet within-subject training (ver2)")
     parser.add_argument('--data_dir', default='./EEG(500Hz)_53ch',
                         help='데이터 디렉토리 (default: ./EEG(500Hz)_53ch)')
     parser.add_argument('--subject', nargs='+', default=None,
@@ -269,10 +306,10 @@ def parse_args():
     parser.add_argument('--stride', type=int, default=4)
     parser.add_argument('--time_bin', type=int, default=16)
     parser.add_argument('--patch_size', type=int, default=64)
-    parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--epochs', type=int, default=500)
-    parser.add_argument('--patience', type=int, default=5,
-                        help='EarlyStopping patience (default: 5)')
+    parser.add_argument('--patience', type=int, default=15,
+                        help='EarlyStopping patience (default: 15)')
     parser.add_argument('--n_classes', type=int, default=6)
     parser.add_argument('--sampling_rate', type=int, default=500)
     parser.add_argument('--no_resume', action='store_true',
@@ -280,8 +317,8 @@ def parse_args():
     parser.add_argument('--devices', nargs='+', type=int, default=None,
                         help='GPU device IDs (e.g. 0 1). 미지정 시 auto')
     parser.add_argument('--num_workers', type=int, default=8)
-    parser.add_argument('--val_interval', type=int, default=10,
-                        help='check_val_every_n_epoch (default: 10)')
+    parser.add_argument('--val_interval', type=int, default=5,
+                        help='check_val_every_n_epoch (default: 5)')
     parser.add_argument('--debug',  action='store_true',
                         help='디버그 모드 (2 epoch, num_workers=0, single GPU)')
     parser.add_argument('--save_id', default=None,
@@ -340,6 +377,10 @@ if __name__ == "__main__":
                 "patch_size": PATCH_SIZE,
     }
 
+    print(f"[ver2] batch_size={config['batch_size']}, patience={config['patience']}, "
+          f"val_interval={args.val_interval}, label_smoothing=0.1, "
+          f"optimizer=AdamW(wd=1e-2), scheduler=CosineAnnealingLR")
+
     # -------------------------------------------------------
     # Discover all subjects
     # -------------------------------------------------------
@@ -352,7 +393,7 @@ if __name__ == "__main__":
     print(f"[*] Found {len(subject_ids)} subjects: {subject_ids}")
 
     RESUME_MODE = not args.no_resume
-    root_log_dir = f"./EEGNet/within_logs/{config['sampling_rate']}Hz_t{TIME_BIN}_s{STRIDE}_w{PATCH_SIZE}"
+    root_log_dir = f"./EEGNet/within_logs_ver2/{config['sampling_rate']}Hz_t{TIME_BIN}_s{STRIDE}_w{PATCH_SIZE}"
     train_date = datetime.now().strftime('%Y%m%d_%H%M')
 
 
@@ -418,7 +459,6 @@ if __name__ == "__main__":
             completed_patches = set()
 
         for patch_idx in range(n_patches):
-        # for patch_idx in range(50, 55):
             if RESUME_MODE and patch_idx in completed_patches:
                 continue
             target_cls = 'All'
@@ -427,7 +467,7 @@ if __name__ == "__main__":
                                f"_t{TIME_BIN}_s{STRIDE}")
             exp_id = f"{train_date}_{experiment_name}"
 
-            base_dir = (f"./EEGNet/within_logs/"
+            base_dir = (f"./EEGNet/within_logs_ver2/"
                         f"{config['sampling_rate']}Hz_t{TIME_BIN}_s{STRIDE}_w{PATCH_SIZE}/"
                         f"{subject_id}/{exp_id}/")
             ckpt_dir = os.path.join(base_dir, "checkpoints")
@@ -459,7 +499,6 @@ if __name__ == "__main__":
                 pin_memory=True,
             )
             print(f"  [DEBUG] train_loader created")
-            # batch = next(iter(train_loader))
             print(f"  [DEBUG] Creating val_dataset...")
             val_dataset = WithinSubjectDatasetTotal(
                 config=config, filepath=subj_files,
@@ -491,7 +530,7 @@ if __name__ == "__main__":
 
             # Logger
             wandb_logger = WandbLogger(
-                project="eegnet_within_total",
+                project="eegnet_within_total_ver2",
                 name=experiment_name,
                 group=f"Within_{subject_id}",
                 job_type="train",
