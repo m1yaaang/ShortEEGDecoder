@@ -21,3 +21,7 @@ EEG(500Hz)_COMB
 EEG(256Hz)_COMB
 EEG(*
 EEGPT/within*
+EEGNet/within*
+resting_eeg
+SVM
+"linear regression"

@@ -21,6 +21,11 @@ from sklearn.metrics import confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+import re
+import pandas as pd
+import torch.nn.functional as F
+from tqdm import tqdm
+
 import matplotlib
 matplotlib.use('Agg')
 
@@ -256,6 +261,64 @@ def discover_all_subjects(data_dir):
     return subject_files
 
 
+def find_completed_patches(subject_dir):
+    """
+    이미 학습 완료된 patch index set 반환.
+    checkpoint 디렉터리에 last.ckpt 또는 epoch ckpt가 존재하면 완료로 판단.
+    """
+    completed = set()
+    if not os.path.exists(subject_dir):
+        return completed
+
+    for exp_name in os.listdir(subject_dir):
+        match = re.search(r'_P(\d+)_t\d+_s\d+$', exp_name)
+        if not match:
+            continue
+        patch_idx = int(match.group(1))
+
+        ckpt_dir = os.path.join(subject_dir, exp_name, "checkpoints")
+        if not os.path.exists(ckpt_dir):
+            continue
+
+        ckpts = [f for f in os.listdir(ckpt_dir)
+                 if f.endswith('.ckpt') and f != 'last.ckpt']
+        has_last = os.path.exists(os.path.join(ckpt_dir, 'last.ckpt'))
+
+        if has_last or len(ckpts) > 0:
+            completed.add(patch_idx)
+
+    return completed
+
+
+def run_subject_inference(config, subject_id, subject_files):
+    """
+    피험자 학습 완료 후 inference (CM + TGM)를 실행.
+    run_EEGPT_within_inference_total의 EEGPTWithinInferenceTotal.run_single_subject 사용.
+    """
+    from EEGPT.run_EEGPT_within_inference_total import EEGPTWithinInferenceTotal
+
+    print(f"\n{'─'*60}")
+    print(f"[Inference] {subject_id} CM + TGM 생성 시작")
+    print(f"{'─'*60}")
+
+    infer_config = config.copy()
+    infer_config["batch_size"] = 64
+    infer_config["shuffle"] = False
+    infer_config["skip_pred"] = False
+    infer_config["test_files"] = subject_files
+
+    model = LitEEGPTCausal_LoRA(
+        config=infer_config,
+        fixed_train_patch_idx=0,
+    )
+
+    manager = EEGPTWithinInferenceTotal(infer_config, model=model)
+    manager.run_single_subject(subject_id, subject_files)
+
+    del model, manager
+    torch.cuda.empty_cache()
+
+
 def is_debugging():
     gettrace = getattr(sys, 'gettrace', None)
     if gettrace is None:
@@ -280,6 +343,12 @@ if __name__ == "__main__":
         num_workers = 8
 
     IS_DEBUG = is_debugging()
+
+    # -------------------------------------------------------
+    # RESUME_MODE: True면 완료된 피험자/패치 건너뛰고 이어서 학습
+    # -------------------------------------------------------
+    RESUME_MODE = True
+    RUN_INFERENCE_PER_SUBJECT = False
 
     STRIDE = 4
     TIME_BIN = 16
@@ -340,8 +409,38 @@ if __name__ == "__main__":
         config["input_len"] = input_len
         config["input_ch"] = input_ch
 
+        # ckpt_dir은 inference에서도 사용 (root level)
+        root_ckpt_dir = (f"./EEGPT/within_total/"
+                         f"{config['sampling_rate']}Hz_t{TIME_BIN}_s{STRIDE}")
+        config["ckpt_dir"] = root_ckpt_dir
+
         print(f"  input_len={input_len}, input_ch={input_ch}, "
               f"n_patches={n_patches} (stride={STRIDE})")
+
+        # --- Resume: 완료된 패치 확인 ---
+        subject_base_dir = os.path.join(root_ckpt_dir, subject_id)
+        completed_patches = set()
+        if RESUME_MODE:
+            completed_patches = find_completed_patches(subject_base_dir)
+
+        if RESUME_MODE and len(completed_patches) >= n_patches:
+            print(f"  [SKIP] 전체 {n_patches} 패치 학습 완료.")
+            if RUN_INFERENCE_PER_SUBJECT:
+                infer_dir = os.path.join(subject_base_dir, "combined_analysis")
+                tgm_exists = any(
+                    f.endswith('.png') and 'TGM' in f
+                    for f in os.listdir(infer_dir)
+                ) if os.path.exists(infer_dir) else False
+                if tgm_exists:
+                    print(f"  [SKIP] Inference도 이미 완료.")
+                else:
+                    run_subject_inference(config, subject_id, subj_files)
+            continue
+
+        remaining = sorted(set(range(n_patches)) - completed_patches)
+        if RESUME_MODE and completed_patches:
+            print(f"  [RESUME] {len(completed_patches)}/{n_patches} 패치 완료. "
+                  f"패치 {remaining[0]}부터 재개 ({len(remaining)}개 남음)")
 
         # Trial-level Split
         train_trial_indices, val_trial_indices, test_trial_indices = \
@@ -355,9 +454,12 @@ if __name__ == "__main__":
               f"Test={len(test_trial_indices)}")
 
         # -------------------------------------------------------
-        # Patch Loop
+        # Patch Loop (resume: 완료된 패치 건너뛰기)
         # -------------------------------------------------------
         for patch_idx in range(n_patches):
+            if RESUME_MODE and patch_idx in completed_patches:
+                continue
+
             target_cls = 'All'
             experiment_name = (f"LORA_Within_{subject_id}"
                                f"_P{patch_idx}"
@@ -371,7 +473,6 @@ if __name__ == "__main__":
             analysis_dir = os.path.join(base_dir, "analysis")
 
             config["save_dir"] = analysis_dir
-            config["ckpt_dir"] = ckpt_dir
             config["patch_idx"] = patch_idx
 
             os.makedirs(ckpt_dir, exist_ok=True)
@@ -482,6 +583,12 @@ if __name__ == "__main__":
             del model, trainer, train_loader, val_loader
             torch.cuda.empty_cache()
 
-        print(f"\n[*] Subject {subject_id} finished.")
+        print(f"\n[*] Subject {subject_id} training finished.")
 
-    print(f"\n[!] All Subjects Training Completed.")
+        # -------------------------------------------------------
+        # Per-subject inference (CM + TGM)
+        # -------------------------------------------------------
+        if RUN_INFERENCE_PER_SUBJECT:
+            run_subject_inference(config, subject_id, subj_files)
+
+    print(f"\n[!] All Subjects Training + Inference Completed.")
